@@ -1,0 +1,35 @@
+{
+  "cli": {
+    "version": ">= 10.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "node": "20.19.4",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "node": "20.19.4",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "node": "20.19.4",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
+        "EAS_BUILD_NO_EXPO_GO_WARNING": "true",
+        "GRADLE_OPTS": "-Dorg.gradle.jvmargs=-Xmx4g"
+      }
+    }
+  }
+}

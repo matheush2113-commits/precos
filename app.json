@@ -1,0 +1,71 @@
+{
+  "expo": {
+    "name": "GEI-IA",
+    "slug": "gestao-estoque",
+    "version": "5.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/splash1.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash1.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "requireFullScreen": false,
+      "bundleIdentifier": "com.seudominio.geiai"
+    },
+    "android": {
+      "package": "com.seudominio.geiai",
+      "versionCode": 6,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "INTERNET",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "POST_NOTIFICATIONS"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/splash1.png",
+        "backgroundColor": "#ffffff"
+      },
+      "googleServicesFile": "./google-services.json"
+    },
+    "web": {
+      "favicon": "./assets/splash1.png"
+    },
+    "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true,
+            "targetSdkVersion": 35,
+            "compileSdkVersion": 35,
+            "buildToolsVersion": "35.0.0",
+            "minSdkVersion": 24
+          }
+        }
+      ],
+      [
+        "onesignal-expo-plugin",
+        {
+          "mode": "development",
+          "devTeam": ""
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "0a3a24b2-d850-425b-95ef-b2ec0cd317de"
+      },
+      "oneSignalAppId": "ddbe0bb6-09cb-49f7-b408-59dedd8731ed"
+    }
+  }
+}
