@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "GEI-IA",
-    "slug": "gestao-estoque",
+    "name": "precoscertos",
+    "slug": "cordeiro",
     "version": "5.0.0",
     "orientation": "portrait",
     "icon": "./assets/splash1.png",
@@ -63,7 +63,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "0a3a24b2-d850-425b-95ef-b2ec0cd317de"
+        "projectId": "73cce3af-c9c5-4521-9d91-c284184659df"
       },
       "oneSignalAppId": "ddbe0bb6-09cb-49f7-b408-59dedd8731ed"
     }
