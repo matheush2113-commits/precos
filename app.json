@@ -7,7 +7,7 @@
     "icon": "./assets/splash1.png",
     "userInterfaceStyle": "light",
     "splash": {
-      "image": "./assets/splash1.png",
+      "image": "./assets/watermarked_img_9624452897969912344.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
@@ -32,7 +32,7 @@
         "POST_NOTIFICATIONS"
       ],
       "adaptiveIcon": {
-        "foregroundImage": "./assets/splash1.png",
+        "foregroundImage": "./assets/watermarked_img_9624452897969912344.png",
         "backgroundColor": "#ffffff"
       },
       "googleServicesFile": "./google-services.json"
