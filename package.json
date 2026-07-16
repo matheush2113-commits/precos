@@ -1,5 +1,5 @@
 {
-  "name": "gei-cordeiro",
+  "name": "app",
   "version": "5.0.0",
   "license": "0BSD",
   "main": "index.js",
@@ -13,39 +13,23 @@
     "build:production": "eas build -p android --profile production"
   },
   "dependencies": {
-    "react": "19.1.0",
-    "react-native": "0.81.5",
-    "@expo/vector-icons": "^15.0.3",
     "expo": "~54.0.0",
-    "expo-navigation-bar": "~5.0.10",
+    "react": "18.3.1",
+    "react-native": "0.76.8",
+    "react-native-paper": "4.9.2",
+    "@expo/vector-icons": "^15.0.3",
     "expo-camera": "~17.0.10",
-    "expo-secure-store": "~15.0.8",
-    "expo-local-authentication": "~17.0.8",
-    "expo-av": "~16.0.8",
-    "expo-notifications": "~0.32.17",
-    "expo-speech-recognition": "^0.3.0",
-    "expo-status-bar": "~3.0.9",
     "react-native-safe-area-context": "~5.6.0",
-    "react-native-screens": "~4.16.0",
-    "expo-clipboard": "~8.0.8",
-    "expo-crypto": "~15.0.9",
-    "expo-constants": "~18.0.13",
-    "expo-font": "~13.3.1",
-    "react-native-qrcode-svg": "*",
-    "react-native-svg": "15.12.1",
+    "expo-linear-gradient": "~15.0.8",
+    "expo-blur": "~15.0.8",
     "expo-haptics": "~15.0.8",
-    "axios": "*",
-    "expo-speech": "~14.0.8",
-    "expo-build-properties": "~1.0.10",
-    "react-native-onesignal": "^5.2.6",
-    "onesignal-expo-plugin": "^2.0.2",
-    "expo-linear-gradient": "~14.0.1",
-    "expo-blur": "~14.0.3",
-    "@react-native-async-storage/async-storage": "~1.23.1",
-    "@expo-google-fonts/inter": "^0.4.2",
-    "expo-splash-screen": "~0.29.21"
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "react-native-svg": "15.12.1",
+    "@expo-google-fonts/inter": "*",
+    "expo-splash-screen": "~31.0.13",
+    "expo-text-extractor": "*"
   },
   "devDependencies": {
-    "@babel/core": "^7.25.0"
+    "@babel/core": "^7.25.2"
   }
 }
