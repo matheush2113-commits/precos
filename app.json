@@ -16,10 +16,10 @@
     ],
     "ios": {
       "requireFullScreen": false,
-      "bundleIdentifier": "com.seudominio.geiai"
+      "bundleIdentifier": "com.seuusuario.geicordeiro"
     },
     "android": {
-      "package": "com.seudominio.geiai",
+      "package": "com.seuusuario.geicordeiro",
       "versionCode": 6,
       "permissions": [
         "CAMERA",
