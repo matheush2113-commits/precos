@@ -28,8 +28,7 @@
         "WRITE_EXTERNAL_STORAGE",
         "INTERNET",
         "RECEIVE_BOOT_COMPLETED",
-        "VIBRATE",
-        "POST_NOTIFICATIONS"
+        "VIBRATE"
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/watermarked_img_9624452897969912344.jpg",
@@ -54,18 +53,16 @@
         }
       ],
       [
-        "onesignal-expo-plugin",
+        "expo-camera",
         {
-          "mode": "development",
-          "devTeam": ""
+          "cameraPermission": "O aplicativo precisa acessar a câmera para escanear os códigos de barras."
         }
       ]
     ],
     "extra": {
       "eas": {
         "projectId": "3794ad4e-d515-4ffd-a201-3a508cbe664e"
-      },
-      "oneSignalAppId": "ddbe0bb6-09cb-49f7-b408-59dedd8731ed"
+      }
     }
   }
 }
