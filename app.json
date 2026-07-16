@@ -4,10 +4,10 @@
     "slug": "cordeiro",
     "version": "5.0.0",
     "orientation": "portrait",
-    "icon": "./assets/watermarked_img_9624452897969912344.png",
+    "icon": "./assets/watermarked_img_9624452897969912344.jpg",
     "userInterfaceStyle": "light",
     "splash": {
-      "image": "./assets/watermarked_img_9624452897969912344.png",
+      "image": "./assets/watermarked_img_9624452897969912344.jpg",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
@@ -32,7 +32,7 @@
         "POST_NOTIFICATIONS"
       ],
       "adaptiveIcon": {
-        "foregroundImage": "./assets/watermarked_img_9624452897969912344.png",
+        "foregroundImage": "./assets/watermarked_img_9624452897969912344.jpg",
         "backgroundColor": "#ffffff"
       },
       "googleServicesFile": "./google-services.json"
