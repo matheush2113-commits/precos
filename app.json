@@ -33,8 +33,7 @@
       "adaptiveIcon": {
         "foregroundImage": "./assets/watermarked_img_9624452897969912344.jpg",
         "backgroundColor": "#ffffff"
-      },
-      "googleServicesFile": "./google-services.json"
+      }
     },
     "web": {
       "favicon": "./assets/splash1.png"
