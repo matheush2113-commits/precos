@@ -17,6 +17,9 @@
       "node": "20.19.4",
       "android": {
         "buildType": "apk"
+      },
+      "env": {
+        "YARN_ENABLE_IMMUTABLE_INSTALLS": "false"
       }
     },
     "production": {
