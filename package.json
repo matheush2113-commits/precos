@@ -28,7 +28,7 @@
     "@expo-google-fonts/inter": "*",
     "expo-splash-screen": "~31.0.13",
     "expo-text-extractor": "*",
-    "expo-build-properties": "~0.13.5"
+    "expo-build-properties": "~57.0.6"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2"
