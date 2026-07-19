@@ -12,16 +12,56 @@ COMO USAR:
 5. Escaneie o QR Code com o app Expo Go (Android/iOS) para rodar no celular
    (a câmera só funciona em dispositivo físico, não no simulador web do Snack).
 
-⚠️ IMPORTANTE — LEIA ANTES DE USAR:
+IMPORTANTE — LEIA ANTES DE USAR:
 Esta versão já conversa DE VERDADE com o Baserow (planilha de preços da
-Cordeiro Supermercados, tabela 322640), com a API Cosmos da Bluesoft e com a
-API do GROK (xAI) para padronização inteligente e simplificada de descrições
-por inteligência artificial.
+Cordeiro Supermercados, tabela 322640) e com a API Cosmos da Bluesoft
+(consulta de produto por código de barras), usando os tokens que você
+me passou. Não existe mais nenhum banco de dados falso/mock — é a mesma
+lógica do backend original (artifacts/api-server), só que rodando direto
+no app, sem servidor Node no meio.
+
+⚠️ MODO INTELIGENTE (leitura por imagem) — ISSO NÃO RODA NO EXPO GO:
+O Modo Inteligente tira UMA foto da embalagem por vez (usando a câmera do
+próprio sistema, via "expo-image-picker" — igual o app de câmera nativo do
+celular) e lê o texto nela (OCR 100% no aparelho, via ML Kit no Android /
+Apple Vision no iOS, usando a biblioteca "expo-text-extractor" — sem chave,
+sem nuvem, sem custo). A versão anterior tentava tirar fotos sozinha em
+loop direto da pré-visualização da câmera (CameraView.takePictureAsync),
+mas isso se mostrou pouco confiável; o padrão de "abrir a câmera do
+sistema, tirar 1 foto, processar" é o mesmo usado no app de exemplo oficial
+da biblioteca e é o que realmente funciona. Só que isso é um módulo NATIVO,
+e o Expo Go (o app genérico da loja) só roda os módulos que já vêm
+pré-instalados nele — não dá pra adicionar um novo módulo nativo dentro do
+Expo Go. Então:
+  • Rodando pelo Snack/Expo Go: o modo EAN-13 (código de barras) funciona
+    normal; o Modo Inteligente vai mostrar um aviso "indisponível aqui".
+  • Pra habilitar de verdade o Modo Inteligente, você precisa gerar um
+    "Dev Client" (seu próprio app compilado, ainda usando Expo):
+      1. npx expo install expo-text-extractor
+      2. npx expo prebuild
+      3. eas build --profile development --platform android (ou ios)
+         (grátis, só precisa de uma conta em expo.dev)
+      4. Instala o app gerado no celular e abre o projeto por ele (em vez
+         do Expo Go) — dali pra frente funciona como um app normal, com
+         atualização ao vivo igual ao Snack.
+  • Sem o Dev Client, use o modo EAN-13 (código de barras) normalmente.
 
 ⚠️ AVISO DE SEGURANÇA — leia antes de compartilhar este Snack:
 Como não há mais servidor entre o app e as APIs, os tokens abaixo (bloco
 "CONFIGURAÇÃO — TOKENS") ficam GRAVADOS NO CÓDIGO e visíveis para qualquer
-pessoa que abrir este Snack ou inspecionar o app.
+pessoa que abrir este Snack ou inspecionar o app (Snacks públicos podem ser
+vistos por qualquer um com o link). Quem tiver o token do Baserow consegue
+ler/editar/apagar sua planilha de preços inteira, quem tiver o token do
+Cosmos consegue gastar suas consultas, e quem tiver a chave da Groq consegue
+gastar seu limite de uso de IA. Recomendações:
+  • Deixe este Snack como PRIVADO (não publique o link).
+  • Se algum dia isso vazar, revogue e gere tokens/chaves novos no Baserow,
+    na Bluesoft e no console da Groq (console.groq.com) imediatamente.
+  • Se quiser, no futuro, colocar isso em produção com segurança, o certo é
+    voltar a usar um servidor (como o artifacts/api-server original) que
+    guarda os tokens no back-end e nunca os expõe no app.
+
+Ignorei imagens/assets do projeto original (ícone, splash), como pedido.
 =================================================================================
 */
 
@@ -60,10 +100,22 @@ import {
   useFonts,
 } from '@expo-google-fonts/inter';
 import * as SplashScreen from 'expo-splash-screen';
-
+// OCR 100% no aparelho (ML Kit no Android / Apple Vision no iOS), sem chave,
+// sem internet, sem custo por consulta.
+//
+// ATENÇÃO — isso é um módulo NATIVO. Dentro do Expo Go (ou do simulador web
+// do Snack) o código nativo do ML Kit/Apple Vision não existe, e carregar
+// esse módulo lança um erro. Um `import` normal do JS roda ANTES de
+// qualquer try/catch do seu código, então um import estático aqui derruba
+// o app inteiro assim que o Expo Go tenta abrir o arquivo — foi exatamente
+// o erro "Cannot find native module 'ExpoTextExtractor'" que você viu.
+// Por isso o carregamento é feito com require() DENTRO de um try/catch:
+// assim, se o módulo nativo não existir, a gente simplesmente desativa o
+// Modo Inteligente (isSmartModeSupported = false) em vez de crashar.
 let extractTextFromImage = null;
 let isTextExtractorSupported = false;
 try {
+  // eslint-disable-next-line global-require
   const textExtractorModule = require('expo-text-extractor');
   extractTextFromImage = textExtractorModule.extractTextFromImage;
   isTextExtractorSupported = !!textExtractorModule.isSupported;
@@ -125,17 +177,32 @@ function formatCentsBuffer(digits) {
   return formatBRL(centsToAmount(normalized));
 }
 
+/**
+ * Formata o valor de volume para exibição na interface.
+ *
+ * REGRA DE CONVERSÃO — a coluna ML no Baserow guarda o volume em litros
+ * quando o valor é menor que 100 (ex.: 1 = 1L, 0.5 = 500ML, 1.5 = 1500ML).
+ * Quando o valor é >= 100, entende-se que está em ml (ex.: 250 = 250ML,
+ * 1000 = 1000ML = 1L).
+ */
 function formatVolume(volume) {
   if (volume === null || volume === undefined) return '';
+
+  // Se o valor está na faixa de litros (1, 1.5, 2, etc.), exibe como litros.
+  // Produtos de leite, água, suco, etc. são gravados como litros no Baserow.
   if (volume > 0 && volume < 100) {
     const label = Number.isInteger(volume) ? String(volume) : volume.toFixed(1).replace('.', ',');
     return `${label}L`;
   }
+
+  // Se o valor está na faixa de ml (>= 100), converte para litros se >= 1000.
   if (volume >= 1000) {
     const liters = volume / 1000;
     const label = Number.isInteger(liters) ? String(liters) : liters.toFixed(1).replace('.', ',');
     return `${label}L`;
   }
+
+  // Valor em ml (100 <= volume < 1000).
   return `${Math.round(volume)}ML`;
 }
 
@@ -300,13 +367,17 @@ function Icon({ name, size = 20, color = '#000000' }) {
 }
 
 /* ------------------------------------------------------------------------ */
-/* CONFIGURAÇÃO — TOKENS (Baserow + Bluesoft Cosmos + xAI Grok)             */
+/* CONFIGURAÇÃO — TOKENS (Baserow + Bluesoft Cosmos)                         */
 /* ------------------------------------------------------------------------ */
+// Veja o AVISO DE SEGURANÇA no topo do arquivo antes de compartilhar este
+// Snack com alguém ou publicá-lo. Para trocar os tokens no futuro, edite
+// só as duas linhas abaixo.
 
 const BASEROW_API_TOKEN = 'Zpp1pMg1AYeG0lnXC1De0hIZID19BUM6';
 const COSMOS_API_TOKEN = 'M3aC1LJBRBGtMuQMvXY2tA';
-const GROK_API_TOKEN = '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';
+const GROQ_API_KEY = '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';
 
+// Planilha "Cordeiro Supermercados" no Baserow: database 123771 / tabela 322640
 const BASEROW_TABLE_ID = '322640';
 const BASEROW_BASE_URL = `https://api.baserow.io/api/database/rows/table/${BASEROW_TABLE_ID}`;
 const FIELD_IDS = {
@@ -316,62 +387,6 @@ const FIELD_IDS = {
   ml: 2349772,
   quantidade: 2349773,
 };
-
-/* ------------------------------------------------------------------------ */
-/* INTEGRAÇÃO REAL COM INTELESGÊNCIA ARTIFICIAL (GROK API)                  */
-/* ------------------------------------------------------------------------ */
-
-/**
- * Envia a descrição poluída do fabricante para a API do Grok e retorna
- * um nome limpo, direto e fácil para o cliente final ler na gôndola/etiqueta.
- */
-async function generateStandardizedDescriptionWithGrok(rawDescription) {
-  if (!GROK_API_TOKEN) return null;
-  try {
-    const response = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROK_API_TOKEN}`
-      },
-      body: JSON.stringify({
-        model: 'grok-beta', // ou o modelo padrão ativo da API do xAI
-        messages: [
-          {
-            role: 'system',
-            content: `Você é um assistente especialista em frente de caixa e automação de supermercados.
-Sua tarefa é receber descrições sujas, confusas ou excessivamente técnicas de produtos vindas de notas fiscais ou APIs de fabricantes, e transformá-las em um padrão limpo, resumido e comercial ideal para gôndolas e etiquetas de preço.
-
-Regras Estritas:
-1. Remova termos técnicos redundantes de embalagens como "UHT", "LONGA VIDA", "TETRA PAK", "PASTEURIZADO".
-2. Ordene sempre como: [NOME DO PRODUTO] [MARCA] [SUBTIPO/VARIANTE] [VOLUME/PESO].
-3. Mantenha em caixa alta (MAIÚSCULAS) e sem acentos.
-4. NUNCA adicione textos explicativos, introduções ou aspas na resposta. Retorne APENAS o nome convertido.
-
-Exemplos de conversão esperada:
-- Entrada: "LEITE UHT COM TAMPA ITALAC INTEGRAL 1L" -> Saída: "LEITE ITALAC INTEGRAL 1L"
-- Entrada: "REFRIGERANTE COCA-COLA ZERO ACUCAR GARRAFA PET 2 L" -> Saída: "COCA-COLA ZERO PET 2L"
-- Entrada: "CERVEJA PILSEN LATA SKOL 350 ML" -> Saída: "CERVEJA SKOL PILSEN LATA 350ML"
-- Entrada: "AGUA MINERAL NATURAL SEM GAS BONAFONT 500ML" -> Saída: "AGUA BONAFONT SEM GAS 500ML"`
-          },
-          {
-            role: 'user',
-            content: `Converta a descrição deste produto seguindo as regras à risca: "${rawDescription}"`
-          }
-        ],
-        temperature: 0.1
-      })
-    });
-
-    if (!response.ok) return null;
-    const json = await response.json();
-    const cleanText = json.choices?.[0]?.message?.content?.trim();
-    return cleanText || null;
-  } catch (error) {
-    console.warn('Falha na consulta da API do Grok:', error);
-    return null; // Fallback para a lógica de regex nativa em caso de erro
-  }
-}
 
 /* ------------------------------------------------------------------------ */
 /* INTEGRAÇÃO REAL COM BASEROW                                               */
@@ -406,6 +421,7 @@ async function baserowFetch(path, init) {
   return res;
 }
 
+/** Busca uma linha pelo CODIGO (código de barras) exato. */
 async function findProductByCodigo(codigo) {
   const params = new URLSearchParams({
     user_field_names: 'true',
@@ -422,6 +438,7 @@ async function findProductByCodigo(codigo) {
   return row ? rowToProduct(row) : null;
 }
 
+/** Busca todas as linhas da tabela, seguindo a paginação. */
 async function listAllProductsRaw() {
   const rows = [];
   let url = `/?${new URLSearchParams({ user_field_names: 'true', size: '200' }).toString()}`;
@@ -484,9 +501,10 @@ async function updateProductRowRemote(id, fields) {
   return rowToProduct(row);
 }
 
+/** Apaga a linha inteira (produto) do Baserow pelo id. */
 async function deleteProductRowRemote(id) {
   const res = await baserowFetch(`/${id}/`, { method: 'DELETE' });
-  if (res.status === 404) return true;
+  if (res.status === 404) return true; // já não existe — considera excluído
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`Baserow delete falhou (status ${res.status}) ${body}`);
@@ -498,6 +516,7 @@ async function deleteProductRowRemote(id) {
 /* INTEGRAÇÃO REAL COM COSMOS (BLUESOFT)                                     */
 /* ------------------------------------------------------------------------ */
 
+/** Consulta um produto pelo GTIN/código de barras no catálogo Cosmos. */
 async function lookupCosmosProduct(gtin) {
   const res = await fetch(`https://api.cosmos.bluesoft.com.br/gtins/${gtin}.json`, {
     method: 'GET',
@@ -516,7 +535,7 @@ async function lookupCosmosProduct(gtin) {
 }
 
 /* ------------------------------------------------------------------------ */
-/* REGRAS DE NOMEAÇÃO LOCAIS (Para Fallback offline se a IA falhar)         */
+/* REGRAS DE NOMEAÇÃO/EMBALAGEM (mesma lógica do backend original)           */
 /* ------------------------------------------------------------------------ */
 
 function extractMl(descriptionUpper) {
@@ -551,19 +570,51 @@ function classifyPackQuantity(descriptionUpper) {
   return { quantidade, needsFardoPrompt };
 }
 
+/* ------------------------------------------------------------------------ */
+/* NOMEAÇÃO PADRONIZADA — LEITE / CERVEJA / REFRIGERANTE / ÁGUA              */
+/* ------------------------------------------------------------------------ */
+//
+// PROBLEMA QUE ISSO RESOLVE:
+// A Cosmos/Bluesoft devolve a "description" exatamente como o FABRICANTE
+// cadastrou o produto, que costuma vir bagunçada e fora de ordem, tipo:
+//     "LEITE UHT DESNATADO 1 L ITALAC"
+// A loja só compra 4 categorias por aqui — leite, cerveja, refrigerante e
+// água — então dá pra forçar um "molde" fixo de nome pra essas 4, sempre na
+// mesma ordem, fácil de bater o olho na gôndola/etiqueta:
+//     "LEITE DESNATADO ITALAC 1LX12"
+//
+// Qualquer produto que NÃO seja uma dessas 4 categorias passa direto pela
+// lógica antiga (produto = description + sufixo), sem risco de bagunçar
+// nome de item que o script não reconhece.
+//
+// BUG DA BLUESOFT (ML no lugar de L): às vezes a descrição vem com a
+// unidade errada — tipo "1ML" quando na real é "1L" (ninguém vende leite,
+// água, refri ou cerveja em embalagem de 1 mililitro). Sempre que o número
+// vier em ML mas for pequeno demais pra fazer sentido físico numa gôndola
+// (<= BUG_GUARD_MAX_ML), a gente reinterpreta como litro automaticamente.
+
 const BUG_GUARD_MAX_ML = 50;
 
+/**
+ * Deixa o texto em maiúsculas, sem acento, mas SEM remover vírgula/ponto
+ * (precisa deles pra não quebrar decimais tipo "1,5L") nem hífen (precisa
+ * dele pra bater "COCA-COLA"). Usada só pra detectar categoria/marca/
+ * subtipo/volume — não é o texto final exibido.
+ */
 function toSearchableUpper(text) {
   return (text ?? '')
     .toString()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u0300-\u036f]/g, '') // remove acentos (Á → A, Ç → C, etc.)
     .toUpperCase()
     .replace(/[^A-Z0-9.,\s-]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+// Dicionário de marcas conhecidas por categoria — é só ir adicionando linha
+// nova aqui se aparecer alguma marca que o fallback (sobra de texto) não
+// está pegando direito.
 const BRANDS = {
   LEITE: [
     'ITALAC', 'PIRACANJUBA', 'JUSSARA', 'NINHO', 'TIROL', 'ITAMBE', 'PARMALAT',
@@ -587,6 +638,7 @@ const BRANDS = {
   ],
 };
 
+// Subtipo/variante por categoria — ordem importa (o primeiro que bater vence).
 const SUBTYPES = {
   LEITE: [
     { re: /SEMI\s*DESNATADO/, label: 'SEMIDESNATADO' },
@@ -614,6 +666,9 @@ const SUBTYPES = {
   ],
 };
 
+// Embalagem — vale a pena manter no nome porque (a) ajuda a identificar o
+// produto na gôndola e (b) no caso da cerveja muda até a quantidade padrão
+// do fardo (long neck = 6, o resto = 12).
 const CONTAINERS = [
   { re: /LONG\s*NECK|\bLN\b/, label: 'LONG NECK' },
   { re: /\bLATA\b/, label: 'LATA' },
@@ -621,6 +676,8 @@ const CONTAINERS = [
   { re: /\bGARRAFA\b|\bVIDRO\b/, label: 'GARRAFA' },
 ];
 
+// Palavras que sabidamente NÃO são marca — usadas só quando o produto não
+// bate em nenhuma marca do dicionário acima, pra "sobrar" só a marca real.
 const NOISE_WORDS = [
   'UHT', 'PASTEURIZADO', 'HOMOGENEIZADO', 'LONGA VIDA', 'ESTERILIZADO',
   'TIPO A', 'TIPO C', 'TETRA PAK', 'CAIXA', 'CX', 'PACOTE', 'PCT', 'UNIDADE',
@@ -637,6 +694,7 @@ function findBrand(searchableUpper, brandList) {
   return null;
 }
 
+/** Marca "sobrando" no texto depois de tirar categoria/subtipo/ruído/volume. */
 function extractBrandFallback(searchableUpper, category) {
   let leftover = searchableUpper;
   leftover = leftover.replace(/\d+(?:[.,]\d+)?\s*(ML|L)\b/g, ' ');
@@ -668,6 +726,10 @@ function extractContainer(searchableUpper) {
   return null;
 }
 
+/**
+ * Identifica se a descrição é LEITE, CERVEJA, REFRIGERANTE ou ÁGUA.
+ * Retorna null pra qualquer outra coisa (produto passa pela lógica antiga).
+ */
 function detectProductCategory(searchableUpper) {
   const isDairyButNotMilkCarton =
     /LEITE DE COCO|LEITE CONDENSADO|CREME DE LEITE|LEITE FERMENTADO|ACHOCOLATADO/.test(searchableUpper);
@@ -680,6 +742,10 @@ function detectProductCategory(searchableUpper) {
   return null;
 }
 
+/**
+ * Extrai o volume em ML, já corrigindo o bug da Bluesoft (ML pequeno demais
+ * que na real é L). Usa a PRIMEIRA ocorrência de número+unidade no texto.
+ */
 function extractVolumeSmart(searchableUpper, category) {
   const match = searchableUpper.match(/(\d+(?:[.,]\d+)?)\s*(ML|L)\b/);
   if (!match) return null;
@@ -689,13 +755,26 @@ function extractVolumeSmart(searchableUpper, category) {
 
   if (unit === 'L') return Math.round(rawNumber * 1000);
 
+  // unit === 'ML'
   const isBugCategory = category === 'LEITE' || category === 'AGUA' || category === 'REFRIGERANTE' || category === 'CERVEJA';
   if (isBugCategory && rawNumber <= BUG_GUARD_MAX_ML) {
+    // "1ML"/"2ML" não existe fisicamente numa gôndola pra essas categorias —
+    // é a Bluesoft perdendo o L. Reinterpreta como litro.
     return Math.round(rawNumber * 1000);
   }
   return Math.round(rawNumber);
 }
 
+/**
+ * Anexa o sufixo de fardo no fim do nome, no formato combinado com a loja:
+ * QUANTIDADE x VALOR — ex.: "6X2L" (fardo com 6 unidades de 2L cada) ou
+ * "6X250ML" (fardo com 6 unidades de 250ml cada). Quando não há quantidade
+ * de fardo (produto vendido/comprado avulso, ou ainda não informado), anexa
+ * só o volume ("2L", "500ML"), sem X nenhum.
+ *
+ * Regra vale pra QUALQUER produto — não só leite/cerveja/água/refrigerante.
+ * Evita duplicar se o nome já terminar com esse mesmo sufixo.
+ */
 function appendPackSuffix(name, ml, quantidade) {
   const base = (name || '').replace(/\s+/g, ' ').trim();
   if (ml === null || ml === undefined) return base;
@@ -707,7 +786,18 @@ function appendPackSuffix(name, ml, quantidade) {
   return `${base} ${suffix}`.replace(/\s+/g, ' ').trim();
 }
 
-function buildStandardizedNameLocal({ category, searchableUpper }) {
+/**
+ * Monta o nome padronizado SEM o sufixo de fardo (o sufixo é sempre anexado
+ * depois, de forma universal, por appendPackSuffix — ver deriveProductFromCosmos
+ * e o handleSubmit da tela de confirmar preço).
+ *
+ * LEITE e CERVEJA levam o nome da categoria na frente (é assim que a
+ * Bluesoft já registra esses dois: "LEITE UHT...", "CERVEJA..."). ÁGUA e
+ * REFRIGERANTE começam pela MARCA quando ela é reconhecida (ex.:
+ * "COCA-COLA PET"), sem repetir a palavra da categoria — só cai pra
+ * "AGUA"/"REFRIGERANTE" quando nenhuma marca foi identificada.
+ */
+function buildStandardizedName({ category, searchableUpper }) {
   const brand = extractBrand(searchableUpper, category);
   const subtype = extractSubtype(searchableUpper, category);
   const container = extractContainer(searchableUpper);
@@ -726,10 +816,126 @@ function buildStandardizedNameLocal({ category, searchableUpper }) {
   return parts.filter(Boolean).join(' ');
 }
 
+/* ------------------------------------------------------------------------ */
+/* SEGUNDA OPINIÃO POR IA (GROQ / LLAMA) — limpar o nome do produto          */
+/* ------------------------------------------------------------------------ */
+//
+// As regras acima (categoria + marca + subtipo + embalagem) já resolvem a
+// maioria dos casos sozinhas, sem precisar de internet nem IA nenhuma. Isso
+// aqui é uma CAMADA A MAIS, opcional: manda a descrição crua da Bluesoft pra
+// um modelo de IA (rodando na Groq, que é rápida e tem plano grátis) só pra
+// ele cortar o excesso de palavras que o dicionário de regras não previu —
+// tipo "COM TAMPA", nome do fabricante por extenso, etc. Exemplo real:
+//   "LEITE UHT COM TAMPA ITALAC INTEGRAL 1L"  →  IA devolve  "LEITE ITALAC INTEGRAL"
+// O volume ("1L") e o fardo ("X12") NUNCA vêm da IA — isso é sempre
+// calculado à parte por appendPackSuffix, matemática de verdade, sem chance
+// de a IA inventar um número errado.
+//
+// Se a chamada falhar por qualquer motivo (sem internet, chave inválida,
+// limite de uso estourado, resposta esquisita), a função devolve null e
+// quem chamou simplesmente usa o nome feito pelas regras — nunca trava o
+// app nem impede de salvar o produto por causa da IA.
+
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GROQ_TIMEOUT_MS = 8000;
+
+const GROQ_SYSTEM_PROMPT = [
+  'Você organiza nomes de produto de supermercado pra ficarem curtos e fáceis',
+  'de ler numa etiqueta de preço, a partir da descrição crua de um cadastro',
+  'de código de barras (Bluesoft/Cosmos). Siga estas regras à risca:',
+  '1. Responda SÓ com o nome final, em maiúsculas, sem aspas, sem explicação,',
+  '   sem comentário nenhum antes ou depois, sem ponto final.',
+  '2. NUNCA inclua volume ou peso (L, ML, KG, G) nem quantidade de fardo',
+  '   (tipo "X12", "12X"). Isso é calculado à parte, não é trabalho seu.',
+  '3. Mantenha só o essencial pra reconhecer o produto na gôndola: categoria',
+  '   (leite, cerveja, refrigerante, água, etc., quando fizer sentido),',
+  '   marca, e a variante/sabor/tipo (integral, desnatado, zero, pilsen,',
+  '   diet, com gás, sem gás, etc.).',
+  '4. Remova ruído: "COM TAMPA", "UHT", "TETRA PAK", "RETORNÁVEL", "TIPO A",',
+  '   nome do fabricante/razão social por extenso, código de barras, número',
+  '   de registro, unidade de venda ("UN", "CX", "PCT").',
+  '5. NUNCA invente marca, sabor ou informação que não esteja na descrição',
+  '   original. Se não tiver certeza de algo, é melhor omitir do que chutar.',
+].join('\n');
+
 /**
- * Deriva nome/ml/quantidade de um produto Cosmos combinando IA do Grok com Regex Local.
+ * Pede pra uma IA (Groq/Llama) uma versão mais limpa do "corpo" do nome do
+ * produto (sem volume, sem fardo — só marca/tipo). Devolve string em
+ * maiúsculas em caso de sucesso, ou `null` se algo deu errado (nesse caso,
+ * quem chamou deve usar o nome das regras normalmente).
  */
-async function deriveProductFromCosmos(cosmos) {
+async function suggestCleanNameWithAI(rawDescription) {
+  const description = (rawDescription ?? '').trim();
+  if (!description) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        temperature: 0.2,
+        max_tokens: 40,
+        messages: [
+          { role: 'system', content: GROQ_SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: `Descrição original: "${description}"\n\nResponda só com o nome limpo, sem volume e sem fardo.`,
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content?.trim();
+    if (!text) return null;
+
+    // Sanitização básica da resposta: tira aspas/pontuação de sobra e
+    // rejeita respostas absurdamente longas ou que ainda tragam volume —
+    // nesses casos é mais seguro confiar no nome das regras.
+    const cleaned = text.replace(/^["'“”]+|["'“”.]+$/g, '').trim();
+    const looksLikeVolume = /\d\s*(ML|L|KG|G)\b/i.test(cleaned);
+    if (!cleaned || cleaned.length > 60 || looksLikeVolume) return null;
+
+    return cleaned.toUpperCase();
+  } catch {
+    return null; // sem internet, timeout, chave inválida, limite estourado etc.
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Deriva nome/ml/quantidade de um produto Cosmos.
+ *
+ * REGRA DE VOLUME: quando o volume extraído é >= 1000ml, converte para
+ * litros na coluna ML do Baserow (1000 → 1, 2000 → 2). Quando é < 1000ml,
+ * mantém em ml (250, 350, 473, 600, etc.). O Baserow nunca guarda 1000 —
+ * guarda 1.
+ *
+ * NOME: se a descrição for identificada como LEITE, CERVEJA, REFRIGERANTE
+ * ou ÁGUA, o "corpo" do nome é reconstruído do zero num formato padronizado
+ * (ver bloco "NOMEAÇÃO PADRONIZADA" acima). Qualquer outro produto mantém o
+ * nome original da Bluesoft. Em TODOS os casos, sem exceção, o sufixo de
+ * fardo "QUANTIDADE x VALOR" (ex.: "6X2L", "6X250ML") é anexado no final
+ * por appendPackSuffix — essa parte vale pra qualquer produto, não só pras
+ * 4 categorias reconhecidas.
+ *
+ * Esta função em si é 100% baseada em regras (síncrona, sem internet). A
+ * "segunda opinião" por IA (suggestCleanNameWithAI) é aplicada depois, por
+ * quem chama — ver lookupProduct no componente App.
+ */
+function deriveProductFromCosmos(cosmos) {
   const description = (cosmos.description ?? '').trim();
   const descriptionUpper = description.toUpperCase();
   const searchableUpper = toSearchableUpper(description);
@@ -738,26 +944,21 @@ async function deriveProductFromCosmos(cosmos) {
   let ml = extractVolumeSmart(searchableUpper, category);
   const { quantidade, needsFardoPrompt } = classifyPackQuantity(descriptionUpper);
 
+  // Convenção do supermercado: valores >= 1000ml são convertidos para litros
+  // na coluna ML do Baserow. Ex.: 1000 → 1 (1L), 2000 → 2 (2L), 1500 → 1.5 (1,5L).
   if (ml !== null && ml >= 1000) {
     const liters = ml / 1000;
     ml = Number.isInteger(liters) ? liters : Math.round(liters * 10) / 10;
   }
 
-  // 1. Tenta limpar e padronizar o nome comercial usando a IA do Grok
-  let bodyName = await generateStandardizedDescriptionWithGrok(description);
-
-  // 2. Se a IA falhar ou estiver sem rede, entra o Fallback Local (Regex antigo)
-  if (!bodyName) {
-    bodyName = category ? buildStandardizedNameLocal({ category, searchableUpper }) : description;
-  }
-
+  const bodyName = category ? buildStandardizedName({ category, searchableUpper }) : description;
   const produto = appendPackSuffix(bodyName, ml, quantidade);
 
   return { produto, ml, quantidade, needsFardoPrompt };
 }
 
 /* ------------------------------------------------------------------------ */
-/* MODO INTELIGENTE (IMAGEM) — Casamento Levenshtein e variantes            */
+/* MODO INTELIGENTE — melhor correspondência por similaridade (Levenshtein)  */
 /* ------------------------------------------------------------------------ */
 
 function levenshtein(a, b) {
@@ -787,8 +988,14 @@ function similarity(a, b) {
 }
 
 const SUGGESTION_THRESHOLD = 0.6;
+// Correspondência por NOME/imagem é mais "ruidosa" que por código de barras
+// (a OCR erra letra, junta palavra, etc), então o piso de aceitação é um
+// pouco mais baixo — mas os multiplicadores de ML/variante abaixo cortam
+// qualquer match que pareça o produto errado mesmo com nome parecido.
 const TEXT_SUGGESTION_THRESHOLD = 0.5;
 
+// Cache curto de todas as linhas, pra o Modo Inteligente não bater na API do
+// Baserow a cada scan (mesma estratégia do backend original, 15s de TTL).
 let productsCache = null;
 const PRODUCTS_CACHE_TTL_MS = 15000;
 
@@ -806,6 +1013,40 @@ function invalidateProductsCache() {
   productsCache = null;
 }
 
+async function findBestMatchByCodigo(codigo) {
+  const rows = await listAllProductsCached();
+  let best = null;
+  let bestScore = -1;
+  for (const row of rows) {
+    if (!row.codigo) continue;
+    const score = similarity(codigo, row.codigo);
+    if (score > bestScore) {
+      bestScore = score;
+      best = row;
+    }
+  }
+  if (!best || bestScore < SUGGESTION_THRESHOLD) {
+    return { found: false, score: bestScore < 0 ? null : bestScore, product: null };
+  }
+  return { found: true, score: bestScore, product: best };
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE (IMAGEM) — casamento por NOME, com peso pra ML/variante  */
+/*                                                                            */
+/* Diferença chave pro casamento por código de barras: aqui a gente NÃO pode */
+/* confiar só em "o texto parece parecido", porque "COCA COLA" e "COCA COLA  */
+/* ZERO" são MUITO parecidos como string, mas são produtos diferentes. Por   */
+/* isso a similaridade final leva em conta:                                 */
+/*  1) similaridade de string "crua" (Levenshtein) — pega erro de OCR/typo  */
+/*  2) sobreposição de palavras (token overlap) — pega ordem trocada        */
+/*  3) ML extraído do texto (473ML x 350ML) — se os dois têm ML e é         */
+/*     diferente, penaliza pesado (não é o mesmo item mesmo com nome igual) */
+/*  4) "palavras-variante" (ZERO, DIET, LIGHT, LATA, GARRAFA, PET, LN/LONG  */
+/*     NECK, SEM AÇÚCAR, INTEGRAL, DESNATADO...) — se um texto tem e o      */
+/*     outro não, penaliza (evita confundir Coca-Cola com Coca-Cola Zero)   */
+/* ------------------------------------------------------------------------ */
+
 const VARIANT_KEYWORDS = [
   'ZERO', 'DIET', 'LIGHT', 'SEM ACUCAR', 'SEM LACTOSE',
   'LATA', 'GARRAFA', 'PET', 'VIDRO',
@@ -818,7 +1059,7 @@ function normalizeProductText(text) {
   return (text ?? '')
     .toString()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u0300-\u036f]/g, '') // remove acentos
     .toUpperCase()
     .replace(/[^A-Z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -842,6 +1083,11 @@ function tokenOverlapScore(a, b) {
   return shared / Math.max(tokensA.size, tokensB.size);
 }
 
+/**
+ * Similaridade "consciente do produto" entre um texto lido (OCR ou nome
+ * digitado) e o nome de um produto já cadastrado no Baserow.
+ * Retorna um score de 0 a 1.
+ */
 function productTextSimilarity(rawA, rawB) {
   const upperA = normalizeProductText(rawA);
   const upperB = normalizeProductText(rawB);
@@ -851,12 +1097,17 @@ function productTextSimilarity(rawA, rawB) {
   const overlapScore = tokenOverlapScore(upperA, upperB);
   let score = stringScore * 0.45 + overlapScore * 0.55;
 
+  // Penalidade por ML diferente: dois produtos com o mesmo nome mas
+  // tamanhos diferentes (473ML x 350ML) não são o mesmo item.
   const mlA = extractMl(upperA);
   const mlB = extractMl(upperB);
   if (mlA !== null && mlB !== null) {
     if (mlA !== mlB) score *= 0.35;
   }
 
+  // Penalidade por variante diferente (ZERO, LN, GARRAFA, etc): se um dos
+  // textos claramente indica uma variante que o outro não tem, o produto
+  // provavelmente é diferente mesmo com o nome parecido.
   const variantsA = extractVariantSet(upperA);
   const variantsB = extractVariantSet(upperB);
   const onlyInA = [...variantsA].filter((v) => !variantsB.has(v));
@@ -866,6 +1117,12 @@ function productTextSimilarity(rawA, rawB) {
   return Math.max(0, Math.min(1, score));
 }
 
+/**
+ * Modo Inteligente por IMAGEM: recebe o texto extraído da foto (OCR local,
+ * via expo-text-extractor) e procura, no catálogo já salvo no Baserow, o
+ * produto cujo NOME é mais parecido — considerando ML e variante, não só a
+ * string crua. Não depende de código de barras nenhum.
+ */
 async function findBestMatchByProductText(recognizedText) {
   const rows = await listAllProductsCached();
   let best = null;
@@ -888,6 +1145,13 @@ async function findBestMatchByProductText(recognizedText) {
 /* MANUTENÇÃO — limpar todos os preços da planilha de uma vez                */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Varre TODAS as linhas do Baserow e limpa (deixa em branco/null) a coluna
+ * PREÇO de qualquer linha que tenha preço preenchido. Não mexe em CODIGO,
+ * PRODUTO, ML nem QUANTIDADE — só zera o preço, pra recomeçar a contagem
+ * de "produtos enviados" do zero.
+ * Retorna { total, limpos, falhas } pra exibir um resumo pro usuário.
+ */
 async function clearAllPrices(onProgress) {
   const rows = await listAllProductsRaw();
   const withPrice = rows.filter((r) => r.preco !== null && r.preco !== undefined);
@@ -1009,7 +1273,18 @@ function ModeButton({ label, active, onPress }) {
 /* ------------------------------------------------------------------------ */
 
 const SCAN_MODE_STORAGE_KEY = 'preco-certo:scan-mode';
+// No modo EAN-13 a câmera lê código de barras normalmente e continua com a
+// pré-visualização ao vivo (CameraView), sem mudanças.
+//
+// No modo Inteligente a câmera embutida NÃO é usada pra tirar foto. Em vez
+// de ficar tirando fotos sozinha em loop pela pré-visualização (jeito que
+// não se mostrou confiável), o app abre a câmera DO SISTEMA (o mesmo app de
+// câmera nativo do celular, via expo-image-picker) — a pessoa tira UMA foto
+// do rótulo (ou escolhe uma foto já existente na galeria), e só então essa
+// foto é processada pelo OCR local (expo-text-extractor). É exatamente o
+// padrão do app de exemplo oficial da biblioteca.
 const OCR_MIN_TEXT_LENGTH = 3;
+
 const isSmartModeSupported = !!isTextExtractorSupported;
 
 function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, suggestProductByText }) {
@@ -1055,6 +1330,7 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     unlock();
   }, [onGoToConfirm, unlock]);
 
+  // ---- Modo EAN-13: leitura de código de barras normal (sem mudanças) ----
   const handleBarcodeScanned = useCallback(async (result) => {
     if (scanMode !== 'ean13') return;
     if (lockedRef.current) return;
@@ -1064,6 +1340,9 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     goToConfirm(result.data);
   }, [scanMode, goToConfirm]);
 
+  // ---- Modo Inteligente: FOTO ÚNICA (câmera do sistema ou galeria) + OCR local ----
+  // Processa a foto escolhida: lê o texto (OCR local) e casa com o nome do
+  // produto já cadastrado no Baserow (ver findBestMatchByProductText).
   const processSmartImage = useCallback(async (uri) => {
     if (!uri) return;
     setSmartPreviewUri(uri);
@@ -1104,6 +1383,9 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     }
   }, [suggestProductByText]);
 
+  // Abre a câmera do SISTEMA (não a pré-visualização embutida) pra tirar uma
+  // única foto do rótulo — mesmo padrão do app de exemplo do
+  // expo-text-extractor.
   const handleSmartCameraCapture = useCallback(async () => {
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
@@ -1116,7 +1398,9 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
         const uri = result.assets?.[0]?.uri;
         await processSmartImage(uri);
       }
-    } catch {}
+    } catch {
+      // silencioso — se o picker falhar, a pessoa só tenta de novo
+    }
   }, [processSmartImage]);
 
   const handleSmartGalleryPick = useCallback(async () => {
@@ -1131,13 +1415,17 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
         const uri = result.assets?.[0]?.uri;
         await processSmartImage(uri);
       }
-    } catch {}
+    } catch {
+      // silencioso — se o picker falhar, a pessoa só tenta de novo
+    }
   }, [processSmartImage]);
 
   const handleManualEntry = useCallback(() => {
     goToConfirm(null);
   }, [goToConfirm]);
 
+  // A câmera embutida (CameraView) só existe pro modo EAN-13 agora — o modo
+  // Inteligente usa a câmera do sistema por baixo do expo-image-picker.
   const showEan13Camera = scanMode === 'ean13' && permission?.granted;
   const needsEan13Permission = scanMode === 'ean13' && !!permission && !permission.granted;
   const ean13PermissionPending = scanMode === 'ean13' && permission === null;
@@ -1180,7 +1468,9 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
         <View style={styles.suggestionCard}>
           <Text style={styles.errorTitle}>Modo Inteligente indisponível aqui</Text>
           <Text style={{ color: colors.mutedForeground, fontSize: 13, lineHeight: 19, marginTop: 4 }}>
-            A leitura de texto por imagem usa um módulo nativo que só funciona num app compilado. Use o modo EAN-13 por aqui.
+            A leitura de texto por imagem usa um módulo nativo (ML Kit / Apple Vision) que só funciona num app compilado
+            (Dev Client / EAS Build) — não roda dentro do Expo Go nem no simulador do Snack. Use o modo EAN-13 por aqui,
+            ou gere um Dev Client pra habilitar a leitura por imagem.
           </Text>
         </View>
       </View>
@@ -1353,7 +1643,7 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
 
 function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, updateProduct, deleteProduct }) {
   const insets = useSafeAreaInsets();
-  const { codigo } = params;
+  const { codigo } = params; // codigo pode ser null (entrada manual, sem código de barras)
   const isManualEntry = !codigo;
 
   const [data, setData] = useState(null);
@@ -1414,6 +1704,9 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
     const preco = centsToAmount(digits);
     const ml = mlInput.trim() === '' ? null : Number(mlInput.replace(',', '.'));
     const quantidade = quantidadeInput.trim() === '' ? null : Number(quantidadeInput.replace(',', '.'));
+    // Garante o sufixo "QUANTIDADE x VALOR" (ex.: "6X2L") no nome final,
+    // mesmo quando ML/quantidade foram digitados manualmente aqui — vale
+    // pra qualquer produto, não só leite/cerveja/água/refrigerante.
     const produtoFinal = appendPackSuffix(produto, ml, quantidade);
     setIsPending(true);
     try {
@@ -1433,11 +1726,14 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
     }
   };
 
+  // Apaga o produto inteiro da planilha (CODIGO, PRODUTO, PREÇO, ML e
+  // QUANTIDADE) — só existe pra produto que já está salvo no Baserow
+  // (data?.id). Diferente de "Limpar preços", que só zera o preço.
   const handleDeleteProduct = useCallback(() => {
     if (!data?.id || isDeleting) return;
     showAlert(
       'Excluir produto?',
-      `Isso vai apagar "${data.produto || produto || 'este produto'}" da planilha inteiro. Essa ação não pode ser desfeita.`,
+      `Isso vai apagar "${data.produto || produto || 'este produto'}" da planilha inteiro (código, nome, preço, ML e quantidade). Essa ação não pode ser desfeita.`,
       [
         { text: 'Cancelar', style: 'cancel' },
         {
@@ -1451,6 +1747,12 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
               onDone();
             } catch {
               Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+              showAlert(
+                'Erro ao excluir',
+                'Não foi possível excluir o produto. Verifique a conexão e tente de novo.',
+                [{ text: 'OK', style: 'default' }],
+                { icon: 'alert-circle', iconColor: colors.destructive },
+              );
             } finally {
               setIsDeleting(false);
             }
@@ -1476,7 +1778,7 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
     return (
       <View style={[styles.centerFill, { backgroundColor: colors.background }]}>
         <ActivityIndicator color={colors.primary} size="large" />
-        <Text style={{ color: colors.mutedForeground, marginTop: 12 }}>Consultando produto e IA…</Text>
+        <Text style={{ color: colors.mutedForeground, marginTop: 12 }}>Consultando produto…</Text>
       </View>
     );
   }
@@ -1531,6 +1833,12 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
                   <Text style={styles.editBadgeText}>Editando preço</Text>
                 </View>
               )}
+              {isManualEntry && (
+                <LinearGradient colors={['#7c3aed', '#06b6d4']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={styles.editBadge}>
+                  <Icon name="edit-3" size={11} color="#ffffff" />
+                  <Text style={[styles.editBadgeText, { color: '#ffffff' }]}>Manual</Text>
+                </LinearGradient>
+              )}
             </View>
 
             <View style={styles.nameRow}>
@@ -1547,7 +1855,7 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
                 />
               ) : (
                 <Pressable onPress={() => setEditingName(true)} style={styles.nameDisplay}>
-                  <Text style={styles.nameText}>{produto || 'Toque para nomear'}</Text>
+                  <Text style={styles.nameText}>{produto || 'Toque para nomear o produto'}</Text>
                   <Icon name="edit-3" size={16} color={colors.mutedForeground} />
                 </Pressable>
               )}
@@ -1602,9 +1910,19 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
             </View>
 
             {!!data?.id && (
-              <Pressable onPress={handleDeleteProduct} disabled={isDeleting} style={styles.deleteProductRow}>
-                <Icon name="trash-2" size={14} color={colors.destructive} />
-                <Text style={styles.deleteProductRowText}>Excluir este produto</Text>
+              <Pressable
+                onPress={handleDeleteProduct}
+                disabled={isDeleting}
+                style={({ pressed }) => [styles.deleteProductRow, { opacity: pressed || isDeleting ? 0.55 : 1 }]}
+              >
+                {isDeleting ? (
+                  <ActivityIndicator size="small" color={colors.destructive} />
+                ) : (
+                  <Icon name="trash-2" size={14} color={colors.destructive} />
+                )}
+                <Text style={styles.deleteProductRowText}>
+                  {isDeleting ? 'Excluindo produto…' : 'Excluir este produto'}
+                </Text>
               </Pressable>
             )}
           </View>
@@ -1623,11 +1941,11 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
           <NumericKeypad onKeyPress={handleKeyPress} />
 
           <View style={styles.actionsRow}>
-            <Pressable onPress={onBack} style={styles.secondaryButton}>
+            <Pressable onPress={onBack} style={({ pressed }) => [styles.secondaryButton, { borderColor: colors.border, flex: 1, opacity: pressed ? 0.8 : 1 }]}>
               <Icon name="rotate-ccw" size={16} color={colors.foreground} />
               <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Rescanear</Text>
             </Pressable>
-            <Pressable onPress={handleSubmit} disabled={!canSubmit} style={{ flex: 1.4 }}>
+            <Pressable onPress={handleSubmit} disabled={!canSubmit} style={({ pressed }) => [{ flex: 1.4, transform: [{ scale: pressed && canSubmit ? 0.97 : 1 }] }]}>
               <LinearGradient colors={canSubmit ? [colors.accent, '#ff9d1f'] : [colors.muted, colors.muted]} style={styles.submitButton}>
                 {isPending ? (
                   <ActivityIndicator color={colors.accentForeground} />
@@ -1648,20 +1966,34 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
 }
 
 /* ------------------------------------------------------------------------ */
-/* MODAL DE ALERTA ANIMADO                                                   */
+/* MODAL DE ALERTA ANIMADO (substitui o Alert.alert nativo)                  */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * Modal de alerta com animação de fade + escala + leve "bounce", pensado
+ * pra substituir o Alert.alert nativo (feio/sem estilo) por algo que segue
+ * a identidade visual do app. Suporta título, mensagem, ícone e uma lista
+ * de botões com estilos 'default' | 'cancel' | 'destructive'.
+ */
 function AnimatedAlertButton({ button, onPress }) {
   const pressScale = useRef(new Animated.Value(1)).current;
   const isCancel = button.style === 'cancel';
   const isDestructive = button.style === 'destructive';
+
+  const pressIn = () => Animated.spring(pressScale, { toValue: 0.96, useNativeDriver: true, speed: 40 }).start();
+  const pressOut = () => Animated.spring(pressScale, { toValue: 1, useNativeDriver: true, speed: 30 }).start();
 
   const backgroundColor = isDestructive ? colors.destructive : isCancel ? colors.muted : colors.primary;
   const textColor = isDestructive ? colors.destructiveForeground : isCancel ? colors.foreground : colors.primaryForeground;
 
   return (
     <Animated.View style={{ flex: 1, transform: [{ scale: pressScale }] }}>
-      <Pressable onPress={onPress} style={[styles.alertButton, { backgroundColor }]}>
+      <Pressable
+        onPress={onPress}
+        onPressIn={pressIn}
+        onPressOut={pressOut}
+        style={[styles.alertButton, { backgroundColor }]}
+      >
         <Text style={[styles.alertButtonText, { color: textColor }]}>{button.text}</Text>
       </Pressable>
     </Animated.View>
@@ -1669,7 +2001,7 @@ function AnimatedAlertButton({ button, onPress }) {
 }
 
 function useAppAlert() {
-  const [state, setState] = useState(null);
+  const [state, setState] = useState(null); // { title, message, buttons, icon, iconColor }
   const opacity = useRef(new Animated.Value(0)).current;
   const scale = useRef(new Animated.Value(0.85)).current;
   const backdropOpacity = useRef(new Animated.Value(0)).current;
@@ -1687,33 +2019,46 @@ function useAppAlert() {
 
   useEffect(() => {
     if (state) {
+      opacity.setValue(0);
+      scale.setValue(0.85);
+      backdropOpacity.setValue(0);
       Animated.parallel([
-        Animated.timing(backdropOpacity, { toValue: 1, duration: 180, useNativeDriver: true }),
-        Animated.timing(opacity, { toValue: 1, duration: 220, useNativeDriver: true }),
-        Animated.spring(scale, { toValue: 1, friction: 7, useNativeDriver: true }),
+        Animated.timing(backdropOpacity, { toValue: 1, duration: 180, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        Animated.timing(opacity, { toValue: 1, duration: 220, easing: Easing.out(Easing.ease), useNativeDriver: true }),
+        Animated.spring(scale, { toValue: 1, friction: 7, tension: 90, useNativeDriver: true }),
       ]).start();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
   const dismiss = useCallback((onPress) => {
     Animated.parallel([
       Animated.timing(backdropOpacity, { toValue: 0, duration: 150, useNativeDriver: true }),
       Animated.timing(opacity, { toValue: 0, duration: 150, useNativeDriver: true }),
+      Animated.timing(scale, { toValue: 0.9, duration: 150, useNativeDriver: true }),
     ]).start(() => {
       setState(null);
       if (onPress) onPress();
     });
-  }, []);
+  }, [backdropOpacity, opacity, scale]);
 
   const modal = state ? (
-    <Modal transparent visible statusBarTranslucent animationType="none">
+    <Modal transparent visible statusBarTranslucent animationType="none" onRequestClose={() => dismiss()}>
       <Animated.View style={[styles.alertBackdrop, { opacity: backdropOpacity }]}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={() => dismiss()} />
         <Animated.View style={[styles.alertCard, { opacity, transform: [{ scale }] }]}>
+          <View style={[styles.alertIconWrap, { backgroundColor: `${state.iconColor}1f` }]}>
+            <Icon name={state.icon} size={26} color={state.iconColor} />
+          </View>
           <Text style={styles.alertTitle}>{state.title}</Text>
           {!!state.message && <Text style={styles.alertMessage}>{state.message}</Text>}
           <View style={styles.alertButtonsRow}>
             {state.buttons.map((button, index) => (
-              <AnimatedAlertButton key={index} button={button} onPress={() => dismiss(button.onPress)} />
+              <AnimatedAlertButton
+                key={`${button.text}-${index}`}
+                button={button}
+                onPress={() => dismiss(button.onPress)}
+              />
             ))}
           </View>
         </Animated.View>
@@ -1758,22 +2103,56 @@ function SentScreen({ onBack, onOpenConfirm, listSentProducts, clearAllPrices })
 
   const runClear = useCallback(async () => {
     setClearing(true);
+    setClearProgress({ done: 0, total: count });
     try {
       const result = await clearAllPrices((p) => setClearProgress(p));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       await load();
+      showAlert(
+        'Preços limpos',
+        `${result.limpos} de ${result.total} preço(s) apagado(s)${result.falhas ? ` — ${result.falhas} falharam.` : '.'}`,
+        [{ text: 'OK', style: 'default' }],
+        { icon: 'check-circle', iconColor: colors.success },
+      );
     } catch {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+      showAlert(
+        'Erro',
+        'Não foi possível limpar os preços. Verifique a conexão e tente de novo.',
+        [{ text: 'OK', style: 'default' }],
+        { icon: 'alert-circle', iconColor: colors.destructive },
+      );
     } finally {
       setClearing(false);
       setClearProgress(null);
     }
-  }, [clearAllPrices, load]);
+  }, [clearAllPrices, count, load]);
 
   const confirmClear = useCallback(() => {
     if (count === 0 || clearing) return;
-    showAlert('Limpar todos os preços?', 'Isso vai apagar o preço de todos produtos enviados da planilha.', [
-      { text: 'Cancelar', style: 'cancel' },
-      { text: 'Limpar tudo', style: 'destructive', onPress: runClear }
-    ]);
+    showAlert(
+      'Limpar todos os preços?',
+      `Isso vai apagar o preço de ${count} produto(s) já enviados (CODIGO, PRODUTO, ML e QUANTIDADE não são afetados). Essa ação não pode ser desfeita.`,
+      [
+        { text: 'Cancelar', style: 'cancel' },
+        {
+          text: 'Sim, limpar tudo',
+          style: 'destructive',
+          onPress: () => {
+            showAlert(
+              'Tem certeza mesmo?',
+              'Confirme de novo para apagar todos os preços agora.',
+              [
+                { text: 'Cancelar', style: 'cancel' },
+                { text: 'Limpar agora', style: 'destructive', onPress: runClear },
+              ],
+              { icon: 'delete', iconColor: colors.destructive },
+            );
+          },
+        },
+      ],
+      { icon: 'delete', iconColor: colors.destructive },
+    );
   }, [count, clearing, runClear, showAlert]);
 
   return (
@@ -1788,8 +2167,25 @@ function SentScreen({ onBack, onOpenConfirm, listSentProducts, clearAllPrices })
         </Pressable>
       </View>
 
+      {clearing && (
+        <View style={[styles.suggestionChecking, { paddingVertical: 6 }]}>
+          <ActivityIndicator color={colors.destructive} />
+          <Text style={styles.suggestionCheckingText}>
+            Limpando preços… {clearProgress ? `${clearProgress.done}/${clearProgress.total}` : ''}
+          </Text>
+        </View>
+      )}
+
       <LinearGradient colors={[colors.primary, '#0f2f8f']} style={styles.heroCard}>
-        <Text style={styles.heroLabel}>Produtos enviados</Text>
+        <View style={styles.heroTopRow}>
+          <View>
+            <Text style={styles.heroLabel}>Produtos enviados</Text>
+            <Text style={styles.heroSubtitle}>Preços já atualizados no sistema</Text>
+          </View>
+          <View style={styles.heroIconWrap}>
+            <Icon name="check-circle" size={18} color={colors.accentForeground} />
+          </View>
+        </View>
         <View style={styles.heroCountRow}>
           <Text style={styles.heroCount}>{count}</Text>
           <Text style={styles.heroCountUnit}>{count === 1 ? 'item' : 'itens'}</Text>
@@ -1797,9 +2193,19 @@ function SentScreen({ onBack, onOpenConfirm, listSentProducts, clearAllPrices })
       </LinearGradient>
 
       {isLoading ? (
-        <View style={styles.centerState}><Text>Carregando…</Text></View>
+        <View style={styles.centerState}><Text style={{ color: colors.mutedForeground }}>Carregando…</Text></View>
+      ) : isError ? (
+        <View style={styles.centerState}>
+          <Icon name="alert-circle" size={28} color={colors.destructive} />
+          <Text style={styles.emptyTitle}>Não foi possível carregar</Text>
+          <Text style={{ color: colors.mutedForeground }}>Verifique a conexão e tente novamente.</Text>
+        </View>
       ) : items.length === 0 ? (
-        <View style={styles.centerState}><Text>Nenhum produto enviado ainda.</Text></View>
+        <View style={styles.centerState}>
+          <Icon name="inbox" size={28} color={colors.mutedForeground} />
+          <Text style={styles.emptyTitle}>Nenhum produto enviado ainda</Text>
+          <Text style={{ color: colors.mutedForeground, textAlign: 'center' }}>Escaneie um produto e registre o preço para vê-lo aqui.</Text>
+        </View>
       ) : (
         <FlatList
           data={items}
@@ -1818,12 +2224,12 @@ function SentScreen({ onBack, onOpenConfirm, listSentProducts, clearAllPrices })
 }
 
 /* ------------------------------------------------------------------------ */
-/* APP RAIZ                                                                 */
+/* APP RAIZ — controla qual "tela" está visível (sem expo-router)           */
 /* ------------------------------------------------------------------------ */
 
 export default function App() {
   const [fontsLoaded, fontError] = useFonts({ Inter_400Regular, Inter_500Medium, Inter_600SemiBold, Inter_700Bold });
-  const [screen, setScreen] = useState('scanner');
+  const [screen, setScreen] = useState('scanner'); // 'scanner' | 'confirm' | 'sent'
   const [confirmParams, setConfirmParams] = useState(null);
   const [sentCount, setSentCount] = useState(0);
 
@@ -1831,20 +2237,28 @@ export default function App() {
     if (fontsLoaded || fontError) SplashScreen.hideAsync().catch(() => {});
   }, [fontsLoaded, fontError]);
 
+  // ---- API REAL: Baserow (planilha de preços) + Cosmos/Bluesoft (catálogo) ----
   const lookupProduct = useCallback(async (codigo) => {
     const existing = await findProductByCodigo(codigo);
     if (existing) return { ...existing, source: 'baserow' };
 
     const cosmos = await lookupCosmosProduct(codigo);
     if (!cosmos) {
-      return { id: null, codigo, produto: '', preco: null, ml: null, quantity: null, source: 'notfound' };
+      return { id: null, codigo, produto: '', preco: null, ml: null, quantidade: null, source: 'notfound' };
     }
 
-    // Passa pela derivação inteligente (Grok com Fallback Regex)
-    const derived = await deriveProductFromCosmos(cosmos);
+    const derived = deriveProductFromCosmos(cosmos);
+
+    // Segunda opinião por IA (Groq/Llama) só pra deixar o "corpo" do nome
+    // mais enxuto (ver suggestCleanNameWithAI). O volume/fardo continuam
+    // sempre calculados por código (appendPackSuffix), nunca pela IA. Se a
+    // IA falhar por qualquer motivo, segue com o nome das regras de sempre.
+    const aiBody = await suggestCleanNameWithAI(cosmos.description);
+    const produtoFinal = aiBody ? appendPackSuffix(aiBody, derived.ml, derived.quantidade) : derived.produto;
+
     const created = await createProductRow({
       codigo,
-      produto: derived.produto,
+      produto: produtoFinal,
       ml: derived.ml,
       quantidade: derived.quantidade,
       preco: null,
@@ -1853,6 +2267,9 @@ export default function App() {
     return { ...created, source: 'cosmos' };
   }, []);
 
+  // Modo Inteligente (imagem): casa o texto lido na embalagem com o NOME do
+  // produto já cadastrado no Baserow (considerando ML e variante — ver
+  // findBestMatchByProductText). Não usa código de barras nenhum.
   const suggestProductByText = useCallback(async (recognizedText) => {
     const match = await findBestMatchByProductText(recognizedText);
     return {
@@ -1867,7 +2284,8 @@ export default function App() {
   }, []);
 
   const runClearAllPrices = useCallback(async (onProgress) => {
-    return clearAllPrices(onProgress);
+    const result = await clearAllPrices(onProgress);
+    return result;
   }, []);
 
   const createProduct = useCallback(async ({ codigo, produto, preco, ml, quantidade }) => {
@@ -1882,6 +2300,8 @@ export default function App() {
     return updated;
   }, []);
 
+  // Exclui o produto inteiro (linha) da planilha — usado pelo botão de
+  // lixeira na tela de confirmar preço.
   const deleteProduct = useCallback(async (id) => {
     await deleteProductRowRemote(id);
     invalidateProductsCache();
@@ -1890,17 +2310,42 @@ export default function App() {
   const listSentProducts = useCallback(async () => {
     const all = await listAllProductsRaw();
     const items = all.filter((p) => p.preco !== null && p.preco !== undefined);
-    return { items, count: items.length };
+    const total = items.reduce((sum, p) => sum + (p.preco ?? 0), 0);
+    return { items, total: Math.round(total * 100) / 100, count: items.length };
   }, []);
+  // ---- fim da API real ----
 
   const refreshSentCount = useCallback(async () => {
     try {
       const result = await listSentProducts();
       setSentCount(result.count);
-    } catch {}
+    } catch {
+      // Silencioso: o badge só deixa de atualizar, não interrompe o uso do app.
+    }
   }, [listSentProducts]);
 
+  // Mantém a bolinha amarela sempre em dia:
+  // 1) busca assim que o app abre;
+  // 2) fica reconsultando o Baserow em intervalos curtos o tempo todo que a
+  //    tela da câmera estiver aberta (outro caixa pode enviar preços também);
+  // 3) reconsulta na hora ao voltar pra câmera (depois de enviar um preço ou
+  //    de limpar tudo na tela "Produtos enviados");
+  // 4) reconsulta quando o app volta pra frente (usuário trocou de app e
+  //    voltou pro Preço Certo).
   useEffect(() => { refreshSentCount(); }, [refreshSentCount]);
+
+  useEffect(() => {
+    if (screen !== 'scanner') return undefined;
+    const interval = setInterval(() => { refreshSentCount(); }, 10000);
+    return () => clearInterval(interval);
+  }, [screen, refreshSentCount]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') refreshSentCount();
+    });
+    return () => subscription.remove();
+  }, [refreshSentCount]);
 
   if (!fontsLoaded && !fontError) return null;
 
@@ -1948,52 +2393,54 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingBottom: 20 },
   headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   logoMark: { width: 32, height: 32, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
-  headerTitle: { color: '#ffffff', fontSize: 17, fontFamily: 'Inter_700Bold' },
-  headerSubtitle: { color: 'rgba(255,255,255,0.6)', fontSize: 11, marginTop: 1 },
+  headerTitle: { color: '#ffffff', fontSize: 17, fontFamily: 'Inter_700Bold', letterSpacing: 0.2 },
+  headerSubtitle: { color: 'rgba(255,255,255,0.6)', fontSize: 11, fontFamily: 'Inter_500Medium', marginTop: 1 },
   headerButton: { width: 42, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.14)' },
-  countBadge: { position: 'absolute', top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: colors.accent, alignItems: 'center', justifyContent: 'center' },
+  countBadge: { position: 'absolute', top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 4, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent },
   countBadgeText: { fontSize: 10, fontFamily: 'Inter_700Bold', color: colors.accentForeground },
   overlay: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 28 },
   hintPill: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: 'rgba(0,0,0,0.45)', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 999 },
   hintDot: { width: 7, height: 7, borderRadius: 4 },
-  hint: { color: '#ffffff', fontSize: 14 },
+  hint: { color: '#ffffff', fontSize: 14, fontFamily: 'Inter_500Medium' },
   permissionBox: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 36, gap: 12 },
-  permissionIcon: { width: 72, height: 72, borderRadius: 24, alignItems: 'center', justifyContent: 'center' },
+  permissionIcon: { width: 72, height: 72, borderRadius: 24, alignItems: 'center', justifyContent: 'center', marginBottom: 8 },
   permissionTitle: { color: '#ffffff', fontSize: 20, fontFamily: 'Inter_700Bold' },
-  permissionText: { color: 'rgba(255,255,255,0.75)', fontSize: 14, textAlign: 'center' },
-  permissionButton: { paddingHorizontal: 28, paddingVertical: 15, borderRadius: 16 },
+  permissionText: { color: 'rgba(255,255,255,0.75)', fontSize: 14, fontFamily: 'Inter_400Regular', textAlign: 'center', lineHeight: 20 },
+  permissionButton: { marginTop: 8, paddingHorizontal: 28, paddingVertical: 15, borderRadius: 16 },
   permissionButtonText: { fontSize: 15, fontFamily: 'Inter_700Bold', color: colors.accentForeground },
+  permissionHint: { color: 'rgba(255,255,255,0.75)', fontSize: 13, textAlign: 'center', marginTop: 8 },
   modeSwitch: { position: 'absolute', left: 20, right: 20, flexDirection: 'row', borderRadius: 16, padding: 4, overflow: 'hidden' },
   modeIndicator: { position: 'absolute', top: 4, bottom: 4, width: '50%', borderRadius: 12, backgroundColor: colors.accent },
-  modeButton: { flex: 1, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
-  modeButtonText: { fontSize: 13, fontFamily: 'Inter_600SemiBold' },
+  modeButton: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  modeButtonText: { fontSize: 13, fontFamily: 'Inter_600SemiBold', textAlign: 'center' },
   suggestionBackdrop: { position: 'absolute', left: 0, right: 0, bottom: 0, top: 0, alignItems: 'center', justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.55)', paddingHorizontal: 20, paddingBottom: 130, zIndex: 10 },
   suggestionCard: { width: '100%', borderRadius: 22, padding: 20, gap: 12, backgroundColor: colors.card },
   smartOverlay: { width: '100%', paddingHorizontal: 24, gap: 16 },
   smartPreviewBox: { width: '100%', aspectRatio: 3 / 4, borderRadius: 24, overflow: 'hidden', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.16)' },
-  smartPreviewImage: { width: '100%', height: '100%' },
+  smartPreviewImage: { width: '100%', height: '100%', resizeMode: 'cover' },
   smartPreviewPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 28, gap: 10 },
-  smartPreviewPlaceholderText: { color: 'rgba(255,255,255,0.7)', fontSize: 13, textAlign: 'center' },
+  smartPreviewPlaceholderText: { color: 'rgba(255,255,255,0.7)', fontSize: 13, fontFamily: 'Inter_500Medium', textAlign: 'center', lineHeight: 19 },
   smartProcessingOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(11,20,41,0.65)', alignItems: 'center', justifyContent: 'center', gap: 10 },
-  smartProcessingText: { color: '#ffffff', fontSize: 13 },
+  smartProcessingText: { color: '#ffffff', fontSize: 13, fontFamily: 'Inter_600SemiBold' },
   smartButtonsRow: { flexDirection: 'row', gap: 12, width: '100%' },
   smartSecondaryButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 18, borderRadius: 16, backgroundColor: 'rgba(255,255,255,0.14)' },
-  smartPrimaryButton: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, borderRadius: 16 },
+  smartPrimaryButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, borderRadius: 16 },
   smartButtonText: { color: '#ffffff', fontSize: 14, fontFamily: 'Inter_700Bold' },
   suggestionTag: { alignSelf: 'flex-start', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999 },
-  suggestionTagText: { color: '#ffffff', fontSize: 11, fontFamily: 'Inter_700Bold' },
+  suggestionTagText: { color: '#ffffff', fontSize: 11, fontFamily: 'Inter_700Bold', letterSpacing: 0.2 },
   suggestionChecking: { alignItems: 'center', gap: 10, paddingVertical: 12 },
+  suggestionCheckingText: { color: colors.mutedForeground, fontFamily: 'Inter_500Medium' },
   suggestionTitle: { fontSize: 17, fontFamily: 'Inter_700Bold', color: colors.foreground },
-  suggestionSubtitle: { fontSize: 13, color: colors.mutedForeground },
-  suggestionProduct: { borderRadius: 14, padding: 14, backgroundColor: colors.muted },
+  suggestionSubtitle: { fontSize: 13, fontFamily: 'Inter_500Medium', marginTop: -6, color: colors.mutedForeground },
+  suggestionProduct: { borderRadius: 14, padding: 14, gap: 4, backgroundColor: colors.muted },
   suggestionProductName: { fontSize: 16, fontFamily: 'Inter_700Bold', color: colors.foreground },
   suggestionProductPrice: { fontSize: 20, fontFamily: 'Inter_700Bold', color: colors.success },
   suggestionActions: { flexDirection: 'row', gap: 10 },
   suggestionSecondaryButton: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14, borderWidth: 1 },
-  suggestionPrimaryButton: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14 },
+  suggestionPrimaryButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14 },
   scanContainer: { alignItems: 'center', justifyContent: 'center', gap: 14 },
   smartBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999 },
-  smartBadgeText: { color: '#ffffff', fontSize: 12, fontFamily: 'Inter_700Bold' },
+  smartBadgeText: { color: '#ffffff', fontSize: 12, fontFamily: 'Inter_700Bold', letterSpacing: 0.2 },
   frame: { borderRadius: 20, overflow: 'hidden' },
   corner: { position: 'absolute', width: 32, height: 32, borderWidth: 4 },
   topLeft: { top: 0, left: 0, borderRightWidth: 0, borderBottomWidth: 0, borderTopLeftRadius: 20 },
@@ -2008,7 +2455,7 @@ const styles = StyleSheet.create({
   rowIconWrap: { width: 40, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.secondary },
   rowInfo: { flex: 1, gap: 2 },
   rowName: { fontSize: 15, fontFamily: 'Inter_600SemiBold', color: colors.foreground },
-  rowCodigo: { fontSize: 12, color: colors.mutedForeground },
+  rowCodigo: { fontSize: 12, fontFamily: 'Inter_400Regular', color: colors.mutedForeground },
   rowPricePill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, backgroundColor: colors.muted },
   rowPrice: { fontSize: 14, fontFamily: 'Inter_700Bold', color: colors.success },
   confirmHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingBottom: 12 },
@@ -2020,40 +2467,47 @@ const styles = StyleSheet.create({
   topRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   codigoBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, alignSelf: 'flex-start', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 10, backgroundColor: colors.secondary },
   codigoText: { fontSize: 12, fontFamily: 'Inter_600SemiBold', color: colors.primary },
-  editBadge: { paddingHorizontal: 8, paddingVertical: 6, borderRadius: 10, flexDirection: 'row', alignItems: 'center', gap: 4 },
+  editBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 8, paddingVertical: 6, borderRadius: 10 },
   editBadgeText: { fontSize: 11, fontFamily: 'Inter_700Bold', color: colors.accentForeground },
   nameRow: { minHeight: 36 },
   nameDisplay: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  nameText: { fontSize: 22, fontFamily: 'Inter_700Bold', color: colors.foreground, flexShrink: 1 },
-  nameInput: { fontSize: 22, fontFamily: 'Inter_700Bold', color: colors.foreground, borderBottomWidth: 2, borderBottomColor: colors.border, paddingVertical: 4, width: '100%' },
+  nameText: { fontSize: 22, fontFamily: 'Inter_700Bold', flexShrink: 1, color: colors.foreground },
+  nameInput: { fontSize: 22, fontFamily: 'Inter_700Bold', borderBottomWidth: 2, borderBottomColor: colors.border, paddingVertical: 4, color: colors.foreground },
   metaRow: { flexDirection: 'row', gap: 8 },
   metaPill: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, backgroundColor: colors.muted },
-  metaText: { fontSize: 12, color: colors.mutedForeground },
+  metaText: { fontSize: 12, fontFamily: 'Inter_500Medium', color: colors.mutedForeground },
   deleteProductRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 12, paddingVertical: 8, borderTopWidth: 1, borderTopColor: colors.border },
   deleteProductRowText: { fontSize: 13, fontFamily: 'Inter_600SemiBold', color: colors.destructive },
-  priceCard: { borderRadius: 24, padding: 20, gap: 4 },
-  previousPriceRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', borderBottomWidth: 1, borderBottomColor: 'rgba(0,0,0,0.08)', paddingBottom: 8, marginBottom: 4 },
-  previousPriceLabel: { color: 'rgba(0,0,0,0.45)', fontSize: 12, fontFamily: 'Inter_500Medium' },
-  previousPriceValue: { color: 'rgba(0,0,0,0.65)', fontSize: 15, fontFamily: 'Inter_600SemiBold' },
-  priceLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 13, fontFamily: 'Inter_600SemiBold' },
-  priceValue: { color: '#ffffff', fontSize: 38, fontFamily: 'Inter_700Bold' },
+  priceCard: { borderRadius: 22, padding: 22, alignItems: 'center' },
+  priceLabel: { fontSize: 13, fontFamily: 'Inter_500Medium', color: 'rgba(255,255,255,0.75)' },
+  priceValue: { fontSize: 42, fontFamily: 'Inter_700Bold', marginTop: 4, color: '#ffffff' },
+  previousPriceRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10, paddingBottom: 10, borderBottomWidth: 1, borderBottomColor: 'rgba(43,29,0,0.15)' },
+  previousPriceLabel: { fontSize: 12, fontFamily: 'Inter_500Medium', color: 'rgba(43,29,0,0.6)' },
+  previousPriceValue: { fontSize: 14, fontFamily: 'Inter_700Bold', color: 'rgba(43,29,0,0.75)', textDecorationLine: 'line-through' },
   actionsRow: { flexDirection: 'row', gap: 12, marginTop: 4 },
-  secondaryButton: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, borderRadius: 16, borderWidth: 1, backgroundColor: colors.card },
-  submitButton: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, borderRadius: 16 },
-  successCircle: { width: 80, height: 80, borderRadius: 40, backgroundColor: colors.success, alignItems: 'center', justifyContent: 'center' },
-  successText: { color: colors.foreground, fontSize: 18, fontFamily: 'Inter_700Bold', marginTop: 12 },
-  errorTitle: { fontSize: 18, fontFamily: 'Inter_700Bold', color: colors.foreground, marginTop: 12 },
-  heroCard: { borderRadius: 24, padding: 22, gap: 12, marginBottom: 16 },
-  heroLabel: { color: 'rgba(255,255,255,0.7)', fontSize: 13, fontFamily: 'Inter_600SemiBold' },
-  heroCountRow: { flexDirection: 'row', alignItems: 'baseline', gap: 6 },
-  heroCount: { color: '#ffffff', fontSize: 36, fontFamily: 'Inter_700Bold' },
-  heroCountUnit: { color: 'rgba(255,255,255,0.8)', fontSize: 15, fontFamily: 'Inter_500Medium' },
-  centerState: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32 },
-  alertBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.5)', alignItems: 'center', justifyContent: 'center', padding: 24 },
-  alertCard: { width: '100%', maxWidth: 320, borderRadius: 20, padding: 20, backgroundColor: colors.card, alignItems: 'center', gap: 12 },
+  secondaryButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, borderRadius: 16, borderWidth: 1 },
+  submitButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, borderRadius: 16 },
+  successCircle: { width: 88, height: 88, borderRadius: 44, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.success },
+  successText: { fontSize: 18, fontFamily: 'Inter_600SemiBold', marginTop: 16, color: colors.foreground },
+  errorTitle: { fontSize: 16, fontFamily: 'Inter_600SemiBold', color: colors.foreground },
+  heroCard: { borderRadius: 24, padding: 22, marginTop: 8, marginBottom: 18 },
+  heroTopRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' },
+  heroLabel: { color: '#ffffff', fontSize: 15, fontFamily: 'Inter_700Bold' },
+  heroSubtitle: { color: 'rgba(255,255,255,0.7)', fontSize: 12, fontFamily: 'Inter_400Regular', marginTop: 2 },
+  heroIconWrap: { width: 34, height: 34, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent },
+  heroCountRow: { flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 18 },
+  heroCount: { color: '#ffffff', fontSize: 52, fontFamily: 'Inter_700Bold', lineHeight: 56 },
+  heroCountUnit: { color: 'rgba(255,255,255,0.75)', fontSize: 16, fontFamily: 'Inter_600SemiBold' },
+  centerState: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 32 },
+  emptyTitle: { fontSize: 16, fontFamily: 'Inter_600SemiBold', marginTop: 4, color: colors.foreground },
+
+  /* Modal de alerta animado (substitui Alert.alert nativo) */
+  alertBackdrop: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(15,27,51,0.45)', paddingHorizontal: 28 },
+  alertCard: { width: '100%', maxWidth: 340, borderRadius: 24, padding: 24, gap: 6, alignItems: 'center', backgroundColor: colors.card, shadowColor: '#0f1b33', shadowOpacity: 0.25, shadowRadius: 24, shadowOffset: { width: 0, height: 12 }, elevation: 12 },
+  alertIconWrap: { width: 56, height: 56, borderRadius: 28, alignItems: 'center', justifyContent: 'center', marginBottom: 6 },
   alertTitle: { fontSize: 18, fontFamily: 'Inter_700Bold', color: colors.foreground, textAlign: 'center' },
-  alertMessage: { fontSize: 14, color: colors.mutedForeground, textAlign: 'center', lineHeight: 20 },
-  alertButtonsRow: { flexDirection: 'row', gap: 10, width: '100%', marginTop: 8 },
-  alertButton: { paddingVertical: 12, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  alertButtonText: { fontSize: 14, fontFamily: 'Inter_600SemiBold' },
+  alertMessage: { fontSize: 14, fontFamily: 'Inter_400Regular', color: colors.mutedForeground, textAlign: 'center', lineHeight: 20, marginTop: 4 },
+  alertButtonsRow: { flexDirection: 'row', gap: 10, marginTop: 18, width: '100%' },
+  alertButton: { paddingVertical: 14, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  alertButtonText: { fontSize: 15, fontFamily: 'Inter_600SemiBold' },
 });
