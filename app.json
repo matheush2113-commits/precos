@@ -56,6 +56,14 @@
         {
           "cameraPermission": "O aplicativo precisa acessar a câmera para escanear os códigos de barras."
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "O aplicativo precisa acessar suas fotos para você escolher a imagem do rótulo do produto.",
+          "cameraPermission": "O aplicativo precisa acessar a câmera para tirar a foto do rótulo do produto.",
+          "microphonePermission": false
+        }
       ]
     ],
     "extra": {
