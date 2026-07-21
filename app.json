@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "PRECO",
-    "slug": "cordeiro",
+    "slug": "gestao-estoque",
     "version": "5.0.1",
     "orientation": "portrait",
     "icon": "./assets/watermarked_img_9624452897969912344.jpg",
@@ -68,7 +68,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "73cce3af-c9c5-4521-9d91-c284184659df"
+        "projectId": "0a3a24b2-d850-425b-95ef-b2ec0cd317de"
       }
     }
   }
