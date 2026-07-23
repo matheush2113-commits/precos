@@ -64,6 +64,14 @@
           "cameraPermission": "O aplicativo precisa acessar a câmera para tirar a foto do rótulo do produto.",
           "microphonePermission": false
         }
+      ],
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "O Preço Certo usa a câmera para ler o código de barras e o texto do rótulo do produto em tempo real.",
+          "enableCodeScanner": true,
+          "enableMicrophonePermission": false
+        }
       ]
     ],
     "extra": {
