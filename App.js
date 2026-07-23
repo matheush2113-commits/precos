@@ -46,6 +46,33 @@ Expo Go. Então:
          atualização ao vivo igual ao Snack.
   • Sem o Dev Client, use o modo EAN-13 (código de barras) normalmente.
 
+⚡ MODO INTELIGENTE "TEMPO REAL" (tipo Google Lens) — INSTALAÇÃO:
+Além do Dev Client acima, se você quiser o modo de VERDADE tempo real (câmera
+sempre ligada, lendo cada frame, sem tirar foto nenhuma — em vez do "loop de
+foto automática" que já funciona), precisa instalar mais 3 pacotes nativos e
+reconstruir o app. Passo a passo:
+  1. npx expo install react-native-vision-camera react-native-worklets-core
+     npm install @bear-block/vision-camera-ocr
+  2. No app.json/app.config.js, adicione o config plugin do vision-camera
+     dentro de "plugins":
+       ["react-native-vision-camera", {
+         "cameraPermissionText": "O Preço Certo usa a câmera pra ler o
+           código de barras e o texto da embalagem.",
+         "enableCodeScanner": true
+       }]
+  3. No babel.config.js, adicione o plugin de worklets (TEM que ser o
+     ÚLTIMO plugin da lista):
+       module.exports = { plugins: [ ['react-native-worklets-core/plugin'] ] };
+  4. npx expo prebuild --clean
+  5. eas build --profile development --platform android (ou ios)
+  6. Instala esse novo app no celular igual ao passo do Dev Client acima.
+Se qualquer um desses pacotes não estiver instalado, o app detecta sozinho
+(ver bloco "MODO INTELIGENTE — TEMPO REAL" mais abaixo, isVisionCameraSupported)
+e volta pro modo de loop de foto — nunca crasha por causa disso.
+IMPORTANTE: react-native-vision-camera precisa ser a versão 4.x (NÃO a 5.x) —
+a v5 mudou de arquitetura (Nitro Modules) e não é compatível com o plugin de
+OCR usado aqui, que ainda depende do sistema antigo de "frame processor".
+
 ⚠️ AVISO DE SEGURANÇA — leia antes de compartilhar este Snack:
 Como não há mais servidor entre o app e as APIs, os tokens abaixo (bloco
 "CONFIGURAÇÃO — TOKENS") ficam GRAVADOS NO CÓDIGO e visíveis para qualquer
@@ -123,6 +150,54 @@ try {
   extractTextFromImage = null;
   isTextExtractorSupported = false;
 }
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE "TEMPO REAL" (tipo Google Lens) — OPCIONAL              */
+/*                                                                            */
+/* Isso usa react-native-vision-camera + um frame processor de OCR, que lê   */
+/* texto de CADA FRAME da câmera ao vivo (ML Kit / Vision Framework rodando  */
+/* direto na thread da câmera) — sem tirar foto nenhuma, de verdade tempo    */
+/* real. É um passo bem maior que o expo-text-extractor acima: precisa de    */
+/* módulo nativo + plugin de frame processor + worklets, e SÓ funciona num   */
+/* app compilado com esses pacotes instalados (não roda no Expo Go nem no    */
+/* Snack — nem mesmo no Dev Client que você já tem hoje, se ele ainda não    */
+/* tiver essas libs. Ver INSTALAÇÃO — MODO TEMPO REAL logo no topo do        */
+/* arquivo). Por isso o carregamento é 100% guardado por try/catch, igual ao */
+/* expo-text-extractor: se não estiver instalado, `isVisionCameraSupported`  */
+/* fica `false` e o app cai de volta pro modo Inteligente "de loop" que já   */
+/* tínhamos (ScannerScreenLegacy, sem mudar nada nele) — nunca crasha.       */
+let VisionCamera = null;
+let performOcr = null;
+let Worklets = null;
+let isVisionCameraSupported = false;
+try {
+  // eslint-disable-next-line global-require
+  VisionCamera = require('react-native-vision-camera');
+  // eslint-disable-next-line global-require
+  const ocrPluginModule = require('@bear-block/vision-camera-ocr');
+  performOcr = ocrPluginModule.performOcr;
+  // eslint-disable-next-line global-require
+  const workletsModule = require('react-native-worklets-core');
+  Worklets = workletsModule.Worklets;
+  isVisionCameraSupported = !!(VisionCamera && VisionCamera.Camera && typeof performOcr === 'function' && Worklets);
+} catch (e) {
+  VisionCamera = null;
+  performOcr = null;
+  Worklets = null;
+  isVisionCameraSupported = false;
+}
+
+// Hooks do vision-camera só existem se o módulo carregou. Quando não carrega,
+// usamos versões "vazias" com a MESMA assinatura — assim dá pra chamar os
+// hooks sempre na mesma ordem (regra dos hooks do React) sem precisar de
+// `if` em volta deles lá no componente.
+const VCCamera = isVisionCameraSupported ? VisionCamera.Camera : null;
+const useVCCameraDevice = isVisionCameraSupported ? VisionCamera.useCameraDevice : () => null;
+const useVCCameraPermission = isVisionCameraSupported
+  ? VisionCamera.useCameraPermission
+  : () => ({ hasPermission: false, requestPermission: async () => false });
+const useVCFrameProcessor = isVisionCameraSupported ? VisionCamera.useFrameProcessor : () => undefined;
+const useVCCodeScanner = isVisionCameraSupported ? VisionCamera.useCodeScanner : () => undefined;
 
 SplashScreen.preventAutoHideAsync().catch(() => {});
 
@@ -1891,7 +1966,434 @@ const STAGE_LABELS = {
   silaba: 'Casamento por sílaba',
 };
 
-function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, suggestProductByText }) {
+/**
+ * Barra de progresso da CONFIANÇA da leitura (0 a 100%) — usada tanto no
+ * modo Inteligente ao vivo (atualiza a cada ciclo de leitura) quanto no
+ * cartão de resultado final. Vermelho = baixa confiança, amarelo = média,
+ * verde = alta — mesma cor em que a pessoa já reconhece "sinal de trânsito".
+ * `dark` controla o tema: `true` (padrão) pra usar sobre a câmera/fundo
+ * escuro, `false` pra usar dentro do cartão branco de resultado.
+ */
+function ConfidenceBar({ score, dark = true }) {
+  const hasScore = score !== null && score !== undefined;
+  const pct = hasScore ? Math.max(0, Math.min(1, score)) : 0;
+  const percentText = Math.round(pct * 100);
+  const barColor = pct >= 0.7 ? colors.success : pct >= 0.4 ? colors.accent : '#ef4444';
+  const labelColor = dark ? 'rgba(255,255,255,0.75)' : colors.mutedForeground;
+  const valueColor = dark ? '#ffffff' : colors.foreground;
+  const trackColor = dark ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.08)';
+  return (
+    <View>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
+        <Text style={{ color: labelColor, fontSize: 11, fontFamily: 'Inter_600SemiBold' }}>Confiança da leitura</Text>
+        <Text style={{ color: valueColor, fontSize: 11, fontFamily: 'Inter_700Bold' }}>{hasScore ? `${percentText}%` : '—'}</Text>
+      </View>
+      <View style={{ height: 8, borderRadius: 999, backgroundColor: trackColor, overflow: 'hidden' }}>
+        <View style={{ height: '100%', width: `${percentText}%`, borderRadius: 999, backgroundColor: barColor }} />
+      </View>
+    </View>
+  );
+}
+
+/**
+ * Ponto de entrada da tela de escaneamento: escolhe automaticamente entre o
+ * Modo Inteligente "tempo real" (LiveTextScanner, se react-native-vision-camera
+ * + o plugin de OCR estiverem instalados) ou o modo "loop de foto automática"
+ * de sempre (ScannerScreenLegacy) — sem exigir nada manual da pessoa que usa
+ * o app, e sem quebrar nada em quem ainda não fez o build com as libs novas.
+ */
+function ScannerScreen(props) {
+  if (isVisionCameraSupported) {
+    return <LiveTextScanner {...props} />;
+  }
+  return <ScannerScreenLegacy {...props} />;
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — TEMPO REAL (frame processor, tipo Google Lens)         */
+/*                                                                            */
+/* Câmera embutida SEMPRE ligada, lendo texto de CADA FRAME direto na thread */
+/* da câmera (performOcr, via react-native-vision-camera + ML Kit/Vision     */
+/* Framework) — sem tirar foto NENHUMA. O casamento com o Baserow           */
+/* (suggestProductByText → enrichRecognizedText, tudo reaproveitado sem      */
+/* mudar uma linha) é CARO — chama IA e às vezes a internet — então ele é   */
+/* limitado a rodar no máximo 1x a cada LIVE_MATCH_THROTTLE_MS, mesmo a OCR  */
+/* rodando a cada frame. O overlay de caixinha em cima do texto (a "cara"    */
+/* de Google Lens) é atualizado bem mais rápido (LIVE_BOX_THROTTLE_MS), já   */
+/* que só desenhar retângulo é barato.                                       */
+/* ------------------------------------------------------------------------ */
+
+const LIVE_MATCH_THROTTLE_MS = 900;
+const LIVE_BOX_THROTTLE_MS = 120;
+
+/**
+ * Caixinhas desenhadas em cima do texto detectado ao vivo — a parte visual
+ * "tipo Google Lens". `boxes` vem em coordenadas do FRAME da câmera (que
+ * quase nunca bate 1:1 com o tamanho da tela); por isso escalamos pela
+ * proporção entre o tamanho do frame e o tamanho da pré-visualização na
+ * tela. Isso é o ponto mais sensível a variar de aparelho pra aparelho — se
+ * as caixinhas aparecerem meio deslocadas num celular específico, é aqui
+ * (scaleX/scaleY) que se ajusta.
+ */
+function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
+  if (!boxes || boxes.length === 0 || !frameWidth || !frameHeight || !previewSize.width) return null;
+  const scaleX = previewSize.width / frameWidth;
+  const scaleY = previewSize.height / frameHeight;
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      {boxes.map((box, index) => (
+        <View
+          key={index}
+          style={{
+            position: 'absolute',
+            left: box.left * scaleX,
+            top: box.top * scaleY,
+            width: box.width * scaleX,
+            height: box.height * scaleY,
+            borderWidth: 2,
+            borderColor: '#06b6d4',
+            borderRadius: 4,
+            backgroundColor: 'rgba(6,182,212,0.12)',
+          }}
+        />
+      ))}
+    </View>
+  );
+}
+
+function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, suggestProductByText }) {
+  const insets = useSafeAreaInsets();
+  const device = useVCCameraDevice('back');
+  const { hasPermission, requestPermission } = useVCCameraPermission();
+  const [permissionAsked, setPermissionAsked] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const [scanMode, setScanMode] = useState('smart');
+  const [suggestion, setSuggestion] = useState(null);
+  const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
+  const [liveBoxes, setLiveBoxes] = useState({ boxes: [], frameWidth: 0, frameHeight: 0 });
+  const [previewSize, setPreviewSize] = useState({ width: 0, height: 0 });
+  const lockedRef = useRef(false);
+  const lastMatchAtRef = useRef(0);
+  const lastBoxUpdateAtRef = useRef(0);
+  const indicatorX = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    AsyncStorage.getItem(SCAN_MODE_STORAGE_KEY).then((stored) => {
+      if (stored === 'ean13' || stored === 'smart') setScanMode(stored);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    Animated.spring(indicatorX, { toValue: scanMode === 'ean13' ? 0 : 1, useNativeDriver: false, damping: 16, stiffness: 180 }).start();
+  }, [scanMode, indicatorX]);
+
+  useEffect(() => {
+    if (!hasPermission && !permissionAsked) {
+      setPermissionAsked(true);
+      requestPermission();
+    }
+  }, [hasPermission, permissionAsked, requestPermission]);
+
+  const indicatorLeft = indicatorX.interpolate({ inputRange: [0, 1], outputRange: ['0%', '50%'] });
+
+  const handleSelectMode = useCallback((mode) => {
+    setScanMode(mode);
+    setSuggestion(null);
+    setLiveStatus(null);
+    setLiveBoxes({ boxes: [], frameWidth: 0, frameHeight: 0 });
+    Haptics.selectionAsync().catch(() => {});
+    AsyncStorage.setItem(SCAN_MODE_STORAGE_KEY, mode).catch(() => {});
+  }, []);
+
+  const unlock = useCallback(() => {
+    lockedRef.current = false;
+    setLocked(false);
+    setSuggestion(null);
+    setLiveStatus(null);
+  }, []);
+
+  const goToConfirm = useCallback((codigo, extra) => {
+    onGoToConfirm({ codigo: codigo ?? null, ...extra });
+    unlock();
+  }, [onGoToConfirm, unlock]);
+
+  const handleManualEntry = useCallback(() => {
+    goToConfirm(null);
+  }, [goToConfirm]);
+
+  // ---- Modo EAN-13: código de barras nativo do vision-camera (useCodeScanner) ----
+  const codeScanner = useVCCodeScanner({
+    codeTypes: ['ean-13'],
+    onCodeScanned: (codes) => {
+      if (scanMode !== 'ean13' || lockedRef.current) return;
+      const value = codes?.[0]?.value;
+      if (!value) return;
+      lockedRef.current = true;
+      setLocked(true);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      goToConfirm(value);
+    },
+  });
+
+  // ---- Modo Inteligente: chamado (na thread JS) toda vez que a OCR lê algo ----
+  // num frame. `boxes` é só pro overlay visual; o casamento de verdade usa
+  // `text`. Ver comentário no topo do bloco sobre os dois throttles.
+  const handleFrameOcrResult = useCallback((text, boxes, frameWidth, frameHeight) => {
+    const now = Date.now();
+
+    if (now - lastBoxUpdateAtRef.current >= LIVE_BOX_THROTTLE_MS) {
+      lastBoxUpdateAtRef.current = now;
+      setLiveBoxes({ boxes: boxes ?? [], frameWidth, frameHeight });
+    }
+
+    if (lockedRef.current) return;
+    const trimmed = (text ?? '').trim();
+    if (trimmed.length < OCR_MIN_TEXT_LENGTH) return;
+    if (now - lastMatchAtRef.current < LIVE_MATCH_THROTTLE_MS) return;
+    lastMatchAtRef.current = now;
+
+    setLiveStatus((prev) => ({ analyzing: true, score: prev?.score ?? null }));
+    suggestProductByText(trimmed)
+      .then((best) => {
+        if (lockedRef.current) return;
+        setLiveStatus({ analyzing: false, score: best.score ?? null });
+        if (best.found && best.produto) {
+          lockedRef.current = true;
+          setLocked(true);
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+          setSuggestion({
+            phase: 'result',
+            recognizedText: trimmed,
+            matchedCodigo: best.codigo ?? null,
+            produto: best.produto,
+            preco: best.preco ?? null,
+            ml: best.ml ?? null,
+            quantidade: best.quantidade ?? null,
+            score: best.score ?? null,
+            stage: best.stage ?? null,
+          });
+        }
+      })
+      .catch(() => {
+        setLiveStatus({ analyzing: false, score: null });
+      });
+  }, [suggestProductByText]);
+
+  // `Worklets.createRunOnJS` é a ponte entre a thread da câmera (worklet, C++
+  // por baixo) e a thread normal do JS/React — sem ela, dava pra ler o texto
+  // mas NUNCA pra atualizar o estado do React ou chamar suggestProductByText.
+  const runOcrResultOnJS = useMemo(
+    () => (Worklets ? Worklets.createRunOnJS(handleFrameOcrResult) : null),
+    [handleFrameOcrResult],
+  );
+
+  const frameProcessor = useVCFrameProcessor((frame) => {
+    'worklet';
+    if (!runOcrResultOnJS) return;
+    const result = performOcr(frame);
+    if (!result?.text) return;
+
+    // Achata blocks → lines → box num array simples de retângulos, só com o
+    // que o overlay precisa (left/top/width/height). Aceita tanto `box`
+    // quanto `boundingBox` como nome do campo, porque isso varia um pouco
+    // entre versão do plugin.
+    const boxes = [];
+    for (const block of result.blocks ?? []) {
+      for (const line of block.lines ?? []) {
+        const box = line.box ?? line.boundingBox;
+        if (box) {
+          boxes.push({
+            left: box.left ?? box.x ?? 0,
+            top: box.top ?? box.y ?? 0,
+            width: box.width ?? 0,
+            height: box.height ?? 0,
+          });
+        }
+      }
+    }
+
+    runOcrResultOnJS(result.text, boxes, frame.width, frame.height);
+  }, [runOcrResultOnJS]);
+
+  const handlePreviewLayout = useCallback((event) => {
+    const { width, height } = event.nativeEvent.layout;
+    setPreviewSize({ width, height });
+  }, []);
+
+  let mainContent = null;
+  if (!hasPermission) {
+    mainContent = (
+      <View style={styles.permissionBox}>
+        <LinearGradient colors={[colors.primary, '#0f2f8f']} style={styles.permissionIcon}>
+          <Icon name="camera" size={30} color="#ffffff" />
+        </LinearGradient>
+        <Text style={styles.permissionTitle}>Precisamos da câmera</Text>
+        <Text style={styles.permissionText}>Para ler o código de barras e o texto da embalagem em tempo real.</Text>
+        <Pressable onPress={requestPermission} style={({ pressed }) => [{ transform: [{ scale: pressed ? 0.97 : 1 }] }]}>
+          <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.permissionButton}>
+            <Text style={styles.permissionButtonText}>Permitir câmera</Text>
+          </LinearGradient>
+        </Pressable>
+      </View>
+    );
+  } else if (scanMode === 'ean13') {
+    mainContent = (
+      <View style={styles.overlay}>
+        <ScanFrame locked={locked} mode={scanMode} />
+        <View style={styles.hintPill}>
+          <View style={[styles.hintDot, { backgroundColor: locked ? colors.success : colors.accent }]} />
+          <Text style={styles.hint}>{locked ? 'Código lido!' : 'Aponte para o código de barras'}</Text>
+        </View>
+      </View>
+    );
+  } else {
+    mainContent = (
+      <View style={[styles.overlay, styles.smartOverlay]}>
+        <ScanFrame locked={locked} mode="smart" />
+
+        <View style={[styles.hintPill, { flexDirection: 'column', alignItems: 'stretch', width: 240, gap: 6 }]}>
+          <Text style={[styles.hint, { textAlign: 'center' }]}>
+            {liveStatus?.analyzing ? 'Analisando…' : 'Aponte para o rótulo do produto'}
+          </Text>
+          <ConfidenceBar score={liveStatus?.score} />
+        </View>
+
+        <Pressable onPress={handleManualEntry} style={({ pressed }) => [styles.hintPill, { backgroundColor: 'rgba(0,0,0,0.3)', opacity: pressed ? 0.7 : 1 }]}>
+          <Text style={styles.hint}>Não achou? Cadastrar manualmente</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.container, { backgroundColor: colors.foreground }]} onLayout={handlePreviewLayout}>
+      {hasPermission && device && (
+        <VCCamera
+          style={StyleSheet.absoluteFill}
+          device={device}
+          isActive={!locked}
+          photo={false}
+          video={false}
+          pixelFormat="yuv"
+          frameProcessor={scanMode === 'smart' ? frameProcessor : undefined}
+          codeScanner={scanMode === 'ean13' ? codeScanner : undefined}
+        />
+      )}
+
+      {scanMode === 'smart' && (
+        <LiveTextBoxes
+          boxes={liveBoxes.boxes}
+          frameWidth={liveBoxes.frameWidth}
+          frameHeight={liveBoxes.frameHeight}
+          previewSize={previewSize}
+        />
+      )}
+
+      <LinearGradient colors={['rgba(11,20,41,0.92)', 'rgba(11,20,41,0.55)', 'rgba(11,20,41,0)']} style={styles.headerGradient} pointerEvents="box-none">
+        <View style={[styles.header, { paddingTop: insets.top + 16 }]}>
+          <View style={styles.headerLeft}>
+            <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.logoMark}>
+              <Icon name="tag" size={14} color={colors.accentForeground} />
+            </LinearGradient>
+            <View>
+              <Text style={styles.headerTitle}>Preço Certo</Text>
+              <Text style={styles.headerSubtitle}>Cordeiro Supermercados</Text>
+            </View>
+          </View>
+          <Pressable onPress={onOpenSent} style={({ pressed }) => [styles.headerButton, { transform: [{ scale: pressed ? 0.93 : 1 }] }]}>
+            <Icon name="list" size={19} color="#ffffff" />
+            {!!sentCount && (
+              <View style={styles.countBadge}>
+                <Text style={styles.countBadgeText}>{sentCount}</Text>
+              </View>
+            )}
+          </Pressable>
+        </View>
+      </LinearGradient>
+
+      {mainContent}
+
+      {suggestion && (
+        <View style={styles.suggestionBackdrop}>
+          <View style={styles.suggestionCard}>
+            <LinearGradient colors={['#7c3aed', '#06b6d4']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={styles.suggestionTag}>
+              <Text style={styles.suggestionTagText}>Modo Inteligente · tempo real</Text>
+            </LinearGradient>
+
+            {suggestion.phase === 'notfound' ? (
+              <>
+                <Text style={styles.suggestionTitle}>Não encontramos esse produto</Text>
+                <Text style={styles.suggestionSubtitle}>
+                  {suggestion.recognizedText
+                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                    : 'Aponte de novo, bem de perto do nome do produto e com boa luz.'}
+                </Text>
+                <View style={styles.suggestionActions}>
+                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => setSuggestion(null)}>
+                    <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Tentar de novo</Text>
+                  </Pressable>
+                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(null)}>
+                    <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
+                      <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>Cadastrar manualmente</Text>
+                    </LinearGradient>
+                  </Pressable>
+                </View>
+              </>
+            ) : (
+              <>
+                <Text style={styles.suggestionTitle}>Produto encontrado pelo texto lido</Text>
+                <Text style={styles.suggestionSubtitle}>
+                  {suggestion.recognizedText
+                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                    : 'Este é o mais parecido no banco de dados:'}
+                </Text>
+                {STAGE_LABELS[suggestion.stage] && (
+                  <View style={[styles.suggestionTag, { alignSelf: 'flex-start', backgroundColor: colors.secondary }]}>
+                    <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
+                  </View>
+                )}
+                <View style={{ marginTop: 8, marginBottom: 4 }}>
+                  <ConfidenceBar score={suggestion.score} dark={false} />
+                </View>
+                <View style={styles.suggestionProduct}>
+                  <Text style={styles.suggestionProductName}>{suggestion.produto}</Text>
+                  {suggestion.preco !== null && suggestion.preco !== undefined && (
+                    <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.preco)}</Text>
+                  )}
+                  {(suggestion.ml || suggestion.quantidade) && (
+                    <Text style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_500Medium', marginTop: 2 }}>
+                      {suggestion.ml ? formatVolume(suggestion.ml) : ''}
+                      {suggestion.ml && suggestion.quantidade ? '  ·  ' : ''}
+                      {suggestion.quantidade ? `Caixa com ${suggestion.quantidade}` : ''}
+                    </Text>
+                  )}
+                </View>
+                <View style={styles.suggestionActions}>
+                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null)}>
+                    <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
+                  </Pressable>
+                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(suggestion.matchedCodigo)}>
+                    <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
+                      <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>É este produto</Text>
+                    </LinearGradient>
+                  </Pressable>
+                </View>
+              </>
+            )}
+          </View>
+        </View>
+      )}
+
+      <BlurView intensity={40} tint="dark" style={[styles.modeSwitch, { bottom: insets.bottom + 28 }]}>
+        <Animated.View style={[styles.modeIndicator, { left: indicatorLeft }]} />
+        <ModeButton label="EAN-13" active={scanMode === 'ean13'} onPress={() => handleSelectMode('ean13')} />
+        <ModeButton label="Inteligente" active={scanMode === 'smart'} onPress={() => handleSelectMode('smart')} />
+      </BlurView>
+    </View>
+  );
+}
+
+function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, suggestProductByText }) {
   const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
   const [locked, setLocked] = useState(false);
@@ -1899,6 +2401,11 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
   const [suggestion, setSuggestion] = useState(null);
   const [ocrProcessing, setOcrProcessing] = useState(false);
   const [smartPreviewUri, setSmartPreviewUri] = useState(null);
+  // ---- Modo Inteligente AO VIVO: estado do "placar" que fica atualizando -
+  // enquanto a câmera embutida fica ligada, sem precisar tocar em nada. ----
+  const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
+  const cameraRef = useRef(null);
+  const smartLoopBusyRef = useRef(false);
   const lockedRef = useRef(false);
   const indicatorX = useRef(new Animated.Value(0)).current;
 
@@ -1918,6 +2425,7 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     setScanMode(mode);
     setSuggestion(null);
     setSmartPreviewUri(null);
+    setLiveStatus(null);
     Haptics.selectionAsync().catch(() => {});
     AsyncStorage.setItem(SCAN_MODE_STORAGE_KEY, mode).catch(() => {});
   }, []);
@@ -1927,6 +2435,7 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     setLocked(false);
     setSuggestion(null);
     setSmartPreviewUri(null);
+    setLiveStatus(null);
   }, []);
 
   const goToConfirm = useCallback((codigo, extra) => {
@@ -1988,9 +2497,78 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     }
   }, [suggestProductByText]);
 
-  // Abre a câmera do SISTEMA (não a pré-visualização embutida) pra tirar uma
-  // única foto do rótulo — mesmo padrão do app de exemplo do
-  // expo-text-extractor.
+  // ---- Modo Inteligente AO VIVO: câmera embutida fica ligada e o app -----
+  // fica lendo sozinho, em ciclos curtos, sem precisar tocar em nada. -------
+  //
+  // Importante ser honesto sobre a técnica aqui: "tempo real" de verdade
+  // (analisar TODO frame da câmera, tipo o Google Lens) não dá pra fazer com
+  // expo-text-extractor, porque ele só lê TEXTO DE UM ARQUIVO DE IMAGEM já
+  // salvo — não tem como ler direto do frame da pré-visualização. O que dá
+  // pra fazer (e é o que está aqui) é um loop curto: a cada ~1.3s, tira uma
+  // foto BEM leve e silenciosa (sem som de câmera, sem mostrar a prévia —
+  // a pessoa continua vendo só a câmera ao vivo por baixo), lê o texto e
+  // testa contra o catálogo, e atualiza a barra de confiança na hora. Pra
+  // quem está usando, PARECE tempo real (não precisa tocar em nada, a
+  // resposta é rápida), mesmo não sendo frame-a-frame de verdade.
+  const SMART_LIVE_INTERVAL_MS = 1300;
+
+  const captureLiveFrame = useCallback(async () => {
+    if (smartLoopBusyRef.current || lockedRef.current) return;
+    if (!cameraRef.current) return;
+    smartLoopBusyRef.current = true;
+    setLiveStatus((prev) => ({ analyzing: true, score: prev?.score ?? null }));
+    try {
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.35,
+        skipProcessing: true,
+      });
+      const uri = photo?.uri;
+      if (!uri) return;
+
+      const lines = await extractTextFromImage(uri);
+      const recognizedText = (lines || []).join(' ').trim();
+      if (recognizedText.length < OCR_MIN_TEXT_LENGTH) {
+        setLiveStatus({ analyzing: false, score: null });
+        return;
+      }
+
+      const best = await suggestProductByText(recognizedText);
+      setLiveStatus({ analyzing: false, score: best.score ?? null });
+
+      if (best.found && best.produto && !lockedRef.current) {
+        lockedRef.current = true;
+        setLocked(true);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+        setSuggestion({
+          phase: 'result',
+          recognizedText,
+          matchedCodigo: best.codigo ?? null,
+          produto: best.produto,
+          preco: best.preco ?? null,
+          ml: best.ml ?? null,
+          quantidade: best.quantidade ?? null,
+          score: best.score ?? null,
+          stage: best.stage ?? null,
+        });
+      }
+    } catch {
+      setLiveStatus({ analyzing: false, score: null });
+    } finally {
+      smartLoopBusyRef.current = false;
+    }
+  }, [suggestProductByText]);
+
+  // Liga o loop só quando: modo Inteligente ativo, suportado, permissão OK e
+  // ainda não travou num resultado. Desliga (limpa o intervalo) em qualquer
+  // outra situação — troca de modo, tela fechada, produto já encontrado.
+  useEffect(() => {
+    if (scanMode !== 'smart' || !isSmartModeSupported || !permission?.granted || locked) {
+      return undefined;
+    }
+    const intervalId = setInterval(captureLiveFrame, SMART_LIVE_INTERVAL_MS);
+    return () => clearInterval(intervalId);
+  }, [scanMode, permission?.granted, locked, captureLiveFrame]);
+
   const handleSmartCameraCapture = useCallback(async () => {
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
@@ -2029,16 +2607,20 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
     goToConfirm(null);
   }, [goToConfirm]);
 
-  // A câmera embutida (CameraView) só existe pro modo EAN-13 agora — o modo
-  // Inteligente usa a câmera do sistema por baixo do expo-image-picker.
-  const showEan13Camera = scanMode === 'ean13' && permission?.granted;
-  const needsEan13Permission = scanMode === 'ean13' && !!permission && !permission.granted;
-  const ean13PermissionPending = scanMode === 'ean13' && permission === null;
+  // A câmera embutida agora fica ligada nos DOIS modos: no EAN-13 pra ler
+  // código de barras, e no Inteligente pra ficar lendo o texto sozinha em
+  // ciclos curtos (ver captureLiveFrame acima). A câmera do sistema
+  // (expo-image-picker) continua disponível como atalho manual — o botão
+  // "Galeria" e o "Tirar foto" de reforço, caso a leitura automática não
+  // pegue por algum motivo (reflexo, letra pequena demais etc.).
+  const showLiveCamera = permission?.granted && (scanMode === 'ean13' || isSmartModeSupported);
+  const needsPermission = !!permission && !permission.granted;
+  const permissionPending = permission === null;
 
   let mainContent = null;
-  if (ean13PermissionPending) {
+  if (permissionPending) {
     mainContent = null;
-  } else if (needsEan13Permission) {
+  } else if (needsPermission) {
     mainContent = (
       <View style={styles.permissionBox}>
         <LinearGradient colors={[colors.primary, '#0f2f8f']} style={styles.permissionIcon}>
@@ -2081,57 +2663,49 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
       </View>
     );
   } else {
+    // Modo Inteligente AO VIVO: a câmera embutida (renderizada mais abaixo)
+    // fica visível o tempo todo por baixo deste overlay — sem foto travada
+    // na tela, sem precisar tocar em nada. O que muda a cada ciclo é só a
+    // barra de confiança e o texto de status.
     mainContent = (
       <View style={[styles.overlay, styles.smartOverlay]}>
-        <View style={styles.smartPreviewBox}>
-          {smartPreviewUri ? (
-            <Image source={{ uri: smartPreviewUri }} style={styles.smartPreviewImage} />
-          ) : (
-            <View style={styles.smartPreviewPlaceholder}>
-              <Icon name="camera" size={30} color="rgba(255,255,255,0.55)" />
-              <Text style={styles.smartPreviewPlaceholderText}>Tire uma foto do rótulo do produto (ou escolha uma da galeria)</Text>
-            </View>
-          )}
-          {ocrProcessing && (
-            <View style={styles.smartProcessingOverlay}>
-              <ActivityIndicator color="#ffffff" />
-              <Text style={styles.smartProcessingText}>Lendo o texto da embalagem…</Text>
-            </View>
-          )}
+        <ScanFrame locked={locked} mode="smart" />
+
+        <View style={[styles.hintPill, { flexDirection: 'column', alignItems: 'stretch', width: 240, gap: 6 }]}>
+          <Text style={[styles.hint, { textAlign: 'center' }]}>
+            {liveStatus?.analyzing ? 'Analisando…' : 'Aponte para o rótulo do produto'}
+          </Text>
+          <ConfidenceBar score={liveStatus?.score} />
         </View>
 
-        {!locked && !ocrProcessing && (
-          <View style={styles.smartButtonsRow}>
-            <Pressable onPress={handleSmartGalleryPick} style={({ pressed }) => [styles.smartSecondaryButton, { opacity: pressed ? 0.75 : 1 }]}>
-              <Icon name="image" size={16} color="#ffffff" />
-              <Text style={styles.smartButtonText}>Galeria</Text>
-            </Pressable>
-            <Pressable onPress={handleSmartCameraCapture} style={({ pressed }) => [{ flex: 1, transform: [{ scale: pressed ? 0.97 : 1 }] }]}>
-              <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.smartPrimaryButton}>
-                <Icon name="camera" size={18} color={colors.accentForeground} />
-                <Text style={[styles.smartButtonText, { color: colors.accentForeground }]}>Tirar foto</Text>
-              </LinearGradient>
-            </Pressable>
-          </View>
-        )}
-
-        {!locked && (
-          <Pressable onPress={handleManualEntry} style={({ pressed }) => [styles.hintPill, { backgroundColor: 'rgba(0,0,0,0.3)', opacity: pressed ? 0.7 : 1 }]}>
-            <Text style={styles.hint}>Não achou? Cadastrar manualmente</Text>
+        <View style={styles.smartButtonsRow}>
+          <Pressable onPress={handleSmartGalleryPick} style={({ pressed }) => [styles.smartSecondaryButton, { opacity: pressed ? 0.75 : 1 }]}>
+            <Icon name="image" size={16} color="#ffffff" />
+            <Text style={styles.smartButtonText}>Galeria</Text>
           </Pressable>
-        )}
+          <Pressable onPress={captureLiveFrame} style={({ pressed }) => [{ flex: 1, transform: [{ scale: pressed ? 0.97 : 1 }] }]}>
+            <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.smartPrimaryButton}>
+              <Icon name="camera" size={18} color={colors.accentForeground} />
+              <Text style={[styles.smartButtonText, { color: colors.accentForeground }]}>Ler agora</Text>
+            </LinearGradient>
+          </Pressable>
+        </View>
+
+        <Pressable onPress={handleManualEntry} style={({ pressed }) => [styles.hintPill, { backgroundColor: 'rgba(0,0,0,0.3)', opacity: pressed ? 0.7 : 1 }]}>
+          <Text style={styles.hint}>Não achou? Cadastrar manualmente</Text>
+        </Pressable>
       </View>
     );
   }
 
   return (
     <View style={[styles.container, { backgroundColor: colors.foreground }]}>
-      {showEan13Camera && (
+      {showLiveCamera && (
         <CameraView
+          ref={cameraRef}
           style={StyleSheet.absoluteFill}
           facing="back"
-          barcodeScannerSettings={{ barcodeTypes: ['ean13'] }}
-          onBarcodeScanned={handleBarcodeScanned}
+          {...(scanMode === 'ean13' ? { barcodeScannerSettings: { barcodeTypes: ['ean13'] }, onBarcodeScanned: handleBarcodeScanned } : {})}
         />
       )}
 
@@ -2203,6 +2777,9 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
                     <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
                   </View>
                 )}
+                <View style={{ marginTop: 8, marginBottom: 4 }}>
+                  <ConfidenceBar score={suggestion.score} dark={false} />
+                </View>
                 <View style={styles.suggestionProduct}>
                   <Text style={styles.suggestionProductName}>{suggestion.produto}</Text>
                   {suggestion.preco !== null && suggestion.preco !== undefined && (
