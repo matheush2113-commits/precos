@@ -557,6 +557,28 @@ function isMilkDescription(descriptionUpper) {
   return /\bLEITE\b/.test(descriptionUpper);
 }
 
+/**
+ * Acha a quantidade de fardo/caixa num texto livre (OCR ou nome cadastrado):
+ * "12X", "X12", "12 X", "CAIXA COM 12", "CX 12", "C/12". Devolve null se não
+ * achar nenhum padrão — nesse caso productTextSimilarity simplesmente ignora
+ * esse sinal (não penaliza nem bonifica).
+ */
+function extractPackQuantityFromText(text) {
+  const upper = (text ?? '').toString();
+  // Formato do catálogo é sempre "QUANTIDADE X VOLUME" grudado, tipo
+  // "12X200ML" ou "6X350ML" — por isso usa um lookahead de dígito depois do
+  // X (não \b, que não bate quando X está colado num número dos dois lados).
+  const beforeX = upper.match(/\b(\d{1,3})\s*X\s*(?=\d)/);
+  if (beforeX) return parseInt(beforeX[1], 10);
+  const afterX = upper.match(/X\s*(\d{1,3})\b/);
+  if (afterX) return parseInt(afterX[1], 10);
+  const caixaCom = upper.match(/\bCAIXA\s*(?:COM)?\s*(\d{1,3})\b/);
+  if (caixaCom) return parseInt(caixaCom[1], 10);
+  const cxAbrev = upper.match(/\bC[XZ]\s*(?:COM)?\s*(\d{1,3})\b/);
+  if (cxAbrev) return parseInt(cxAbrev[1], 10);
+  return null;
+}
+
 function isLongNeckDescription(descriptionUpper) {
   return /LONG\s*NECK|\bLN\b|\bLAGER\b/.test(descriptionUpper);
 }
@@ -1178,7 +1200,15 @@ function normalizeProductText(text) {
   // unidade/fardo (ver comentário acima). Em texto já limpo (nome cadastrado
   // no Baserow) isso não faz diferença nenhuma; quem se beneficia é o texto
   // vindo da OCR da foto.
-  return fixOcrNumberLookalikes(base);
+  const fixed = fixOcrNumberLookalikes(base);
+
+  // Uniformiza "200 ML" (com espaço) e "200ML" (grudado) pro MESMO formato
+  // usado no catálogo (sempre grudado — ver appendPackSuffix). Sem isso, um
+  // texto lido que veio com espaço entre o número e a unidade (comum em
+  // texto de tela/site, e às vezes até na própria OCR por causa do espaço
+  // entre letras) vira um TOKEN diferente de "200ML" e o casamento por
+  // palavra falha, mesmo sendo exatamente o mesmo volume.
+  return fixed.replace(/\b(\d+(?:[.,]\d+)?)\s+(ML|L|KG|G|UN)\b/g, '$1$2');
 }
 
 function extractVariantSet(normalizedUpperText) {
@@ -1187,6 +1217,45 @@ function extractVariantSet(normalizedUpperText) {
     if (normalizedUpperText.includes(keyword)) found.add(keyword);
   }
   return found;
+}
+
+/* ---- PESO POR RARIDADE (idf) — evita casar com o produto ERRADO só ------ */
+/* porque palavras GENÉRICAS bateram --------------------------------------- */
+//
+// PROBLEMA REAL observado: o texto lido "REFRI ZERO COCA COLA 200ML PET..."
+// pode bater com "REFRI GUARANÁ ZERO PET 12X200ML" (produto ERRADO) quase tão
+// bem quanto com "COCA-COLA ZERO PET 200ML" (produto certo), porque REFRI,
+// ZERO e PET aparecem em VÁRIOS produtos do catálogo (refri de qualquer
+// marca, zero-açúcar de qualquer marca, embalagem PET de qualquer coisa) —
+// só COCA/COLA (ou GUARANÁ) é que realmente diferencia UM produto do outro.
+// Se toda palavra vale o mesmo, o casamento pode ganhar por "quantidade de
+// palavra comum batendo", ignorando que a palavra que realmente importa
+// (a marca) não bateu com o produto errado nenhuma.
+//
+// Correção: antes de comparar, calcula quantos produtos do catálogo têm cada
+// palavra (document frequency). Palavra rara (só em 1-2 produtos, tipo a
+// marca) recebe peso ALTO; palavra comum (em quase todo produto, tipo ZERO,
+// PET, REFRI, UN) recebe peso BAIXO. Assim, um candidato só ganha pontuação
+// alta de verdade quando a(s) palavra(s) DISTINTIVA(S) bate(m), não só as
+// genéricas.
+function buildTokenDocumentFrequency(rows) {
+  const df = new Map();
+  for (const row of rows) {
+    if (!row.produto) continue;
+    const tokens = new Set(normalizeProductText(row.produto).split(' ').filter((t) => t.length > 1));
+    for (const token of tokens) {
+      df.set(token, (df.get(token) ?? 0) + 1);
+    }
+  }
+  return { df, totalProducts: rows.length || 1 };
+}
+
+/** idf suavizado: comum (df alto) → peso perto de baixo; raro (df baixo) → peso alto. */
+function tokenWeight(token, tokenFrequency) {
+  if (!tokenFrequency) return 1;
+  const { df, totalProducts } = tokenFrequency;
+  const occurrences = df.get(token) ?? 1;
+  return Math.log(1 + totalProducts / occurrences) + 0.3;
 }
 
 // Quão parecidos dois "tokens" (palavras) precisam ser pra contar como "a
@@ -1203,14 +1272,19 @@ const FUZZY_TOKEN_MATCH_THRESHOLD = 0.72;
  * acima — dando crédito parcial proporcional à semelhança. Isso é o que
  * deixa o casamento resistente a erro de OCR letra-a-letra dentro da
  * própria palavra, sem precisar adivinhar QUAL letra está errada.
+ *
+ * `tokenFrequency` (opcional, ver buildTokenDocumentFrequency) pesa cada
+ * palavra batida pela raridade dela no catálogo — ver comentário acima.
  */
-function tokenOverlapScore(a, b) {
+function tokenOverlapScore(a, b, tokenFrequency) {
   const tokensA = a.split(' ').filter((t) => t.length > 1);
   const tokensB = b.split(' ').filter((t) => t.length > 1);
   if (tokensA.length === 0 || tokensB.length === 0) return 0;
 
   const usedB = new Array(tokensB.length).fill(false);
   let sharedWeight = 0;
+  let totalWeightB = 0;
+  for (const tokenB of tokensB) totalWeightB += tokenWeight(tokenB, tokenFrequency);
 
   for (const tokenA of tokensA) {
     let bestIdx = -1;
@@ -1225,33 +1299,77 @@ function tokenOverlapScore(a, b) {
     }
     if (bestIdx !== -1 && bestSim >= FUZZY_TOKEN_MATCH_THRESHOLD) {
       usedB[bestIdx] = true;
-      sharedWeight += bestSim;
+      sharedWeight += bestSim * tokenWeight(tokensB[bestIdx], tokenFrequency);
     }
   }
 
-  return sharedWeight / Math.max(tokensA.length, tokensB.length);
+  // IMPORTANTE: divide pelo peso total do nome do CATÁLOGO (tokensB), não
+  // pela contagem simples nem pelo maior dos dois textos. O texto "b" aqui é
+  // sempre o nome já cadastrado no Baserow (curto e limpo); o texto "a" é o
+  // que foi lido (OCR, digitado, ou até uma foto de tela cheia de ruído). Se
+  // dividíssemos pelo texto mais longo, um texto lido com bastante ruído em
+  // volta (nome do app, ícone de aba, outros textos na foto) fazia o score
+  // desabar mesmo quando o nome do produto batia certinho lá dentro. E, sem
+  // o peso por raridade, "bater 3 palavras genéricas" contava igual a "bater
+  // a palavra que realmente identifica o produto" — ver comentário acima de
+  // buildTokenDocumentFrequency.
+  return totalWeightB > 0 ? sharedWeight / totalWeightB : 0;
 }
 
 /**
  * Similaridade "consciente do produto" entre um texto lido (OCR ou nome
  * digitado) e o nome de um produto já cadastrado no Baserow.
+ * `tokenFrequency` (opcional) pesa palavra rara/distintiva mais que palavra
+ * genérica do catálogo — ver buildTokenDocumentFrequency.
  * Retorna um score de 0 a 1.
  */
-function productTextSimilarity(rawA, rawB) {
+function productTextSimilarity(rawA, rawB, tokenFrequency) {
   const upperA = normalizeProductText(rawA);
   const upperB = normalizeProductText(rawB);
   if (!upperA || !upperB) return 0;
 
   const stringScore = similarity(upperA, upperB);
-  const overlapScore = tokenOverlapScore(upperA, upperB);
-  let score = stringScore * 0.45 + overlapScore * 0.55;
+  const overlapScore = tokenOverlapScore(upperA, upperB, tokenFrequency);
+  // overlapScore agora é "recall" (quanto do nome do catálogo foi achado
+  // dentro do texto lido — ver comentário em tokenOverlapScore) e por isso é
+  // muito mais confiável quando o texto lido tem ruído extra em volta (outras
+  // palavras na foto, ou até bagunça de tela). O Levenshtein de string
+  // inteira (stringScore) ainda sofre nesse cenário — por isso pesa menos.
+  let score = stringScore * 0.3 + overlapScore * 0.7;
 
-  // Penalidade por ML diferente: dois produtos com o mesmo nome mas
-  // tamanhos diferentes (473ML x 350ML) não são o mesmo item.
+  // ---- ML: sinal "matador" — bate MUITO forte quando é igual, e quase ----
+  // ---- elimina quando é diferente -----------------------------------------
+  // O volume impresso na embalagem (200ML, 350ML, 1L...) é um número exato,
+  // não uma palavra — a OCR quase nunca "inventa" um número que não está lá.
+  // Por isso ele é o sinal mais confiável que existe pra confirmar (ou
+  // descartar) um candidato, mais até que o nome baterem:
+  //   • ML IGUAL → dá um empurrão forte de confiança (ajuda a passar do
+  //     limiar mesmo quando o nome veio com bastante ruído/erro de OCR).
+  //   • ML DIFERENTE → quase elimina o candidato (dois produtos do mesmo
+  //     nome mas tamanho diferente são itens DIFERENTES pra vender, ex.:
+  //     Coca-Cola 200ML não é o mesmo item que Coca-Cola 1L).
   const mlA = extractMl(upperA);
   const mlB = extractMl(upperB);
   if (mlA !== null && mlB !== null) {
-    if (mlA !== mlB) score *= 0.35;
+    if (mlA !== mlB) {
+      score *= 0.12;
+    } else {
+      score = score + (1 - score) * 0.4;
+    }
+  }
+
+  // ---- QUANTIDADE DE FARDO: mesmo princípio do ML, mais fraco -------------
+  // "12X", "X12", "CAIXA COM 12" etc. também é número exato impresso/lido,
+  // mas aparece com menos frequência e formato menos padronizado que o ML —
+  // por isso o bônus/penalidade aqui é mais discreto que o do ML.
+  const quantidadeA = extractPackQuantityFromText(upperA);
+  const quantidadeB = extractPackQuantityFromText(upperB);
+  if (quantidadeA !== null && quantidadeB !== null) {
+    if (quantidadeA !== quantidadeB) {
+      score *= 0.5;
+    } else {
+      score = score + (1 - score) * 0.2;
+    }
   }
 
   // Penalidade por variante diferente (ZERO, LN, GARRAFA, etc): se um dos
@@ -1274,11 +1392,15 @@ function productTextSimilarity(rawA, rawB) {
  */
 async function findBestMatchByProductText(recognizedText) {
   const rows = await listAllProductsCached();
+  // Calcula UMA VEZ a raridade de cada palavra no catálogo inteiro, e reusa
+  // pra todas as linhas — assim uma palavra genérica (ZERO, PET, REFRI) não
+  // pesa tanto quanto a palavra que realmente diferencia os produtos entre si.
+  const tokenFrequency = buildTokenDocumentFrequency(rows);
   let best = null;
   let bestScore = -1;
   for (const row of rows) {
     if (!row.produto) continue;
-    const score = productTextSimilarity(recognizedText, row.produto);
+    const score = productTextSimilarity(recognizedText, row.produto, tokenFrequency);
     if (score > bestScore) {
       bestScore = score;
       best = row;
@@ -1497,7 +1619,10 @@ function syllableOverlapScore(a, b) {
       sharedWeight += bestSim;
     }
   }
-  return sharedWeight / Math.max(syllablesA.length, syllablesB.length);
+  // Mesmo motivo do tokenOverlapScore acima: divide pelo tamanho do nome do
+  // catálogo (b), não pelo maior dos dois — texto lido com ruído extra não
+  // pode "diluir" um casamento que na verdade está certo.
+  return sharedWeight / syllablesB.length;
 }
 
 const SYLLABLE_SUGGESTION_THRESHOLD = 0.55;
@@ -1562,7 +1687,7 @@ async function findBestMatchBySyllable(recognizedText) {
 
 async function enrichRecognizedText(recognizedText) {
   const direct = await findBestMatchByProductText(recognizedText);
-  if (direct.found && direct.score >= 0.75) {
+  if (direct.found && direct.score >= 0.65) {
     return { ...direct, stage: 'direto' };
   }
 
