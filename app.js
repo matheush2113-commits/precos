@@ -376,6 +376,13 @@ function Icon({ name, size = 20, color = '#000000' }) {
 const BASEROW_API_TOKEN = 'Zpp1pMg1AYeG0lnXC1De0hIZID19BUM6';
 const COSMOS_API_TOKEN = 'M3aC1LJBRBGtMuQMvXY2tA';
 const GROQ_API_KEY = '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';
+// Chave do SerpApi (serpapi.com) — usada só como REFORÇO do Modo Inteligente
+// quando o casamento direto (regras + fuzzy) não acha nada de confiança: a
+// gente pesquisa o texto lido no Google de verdade e confere o que aparece.
+// Se essa chave ficar inválida ou estourar o limite de buscas, a função
+// correspondente simplesmente devolve null e o app segue funcionando com as
+// outras camadas (fuzzy, IA, sílaba) — nunca trava por causa disso.
+const SERPAPI_API_KEY = '8c215e3fa31b06c116f4e269dcc2f3cf19d777af7a764398ee0060f076c7798b';
 
 // Planilha "Cordeiro Supermercados" no Baserow: database 123771 / tabela 322640
 const BASEROW_TABLE_ID = '322640';
@@ -1038,11 +1045,16 @@ async function findBestMatchByCodigo(codigo) {
 /* confiar só em "o texto parece parecido", porque "COCA COLA" e "COCA COLA  */
 /* ZERO" são MUITO parecidos como string, mas são produtos diferentes. Por   */
 /* isso a similaridade final leva em conta:                                 */
-/*  1) similaridade de string "crua" (Levenshtein) — pega erro de OCR/typo  */
-/*  2) sobreposição de palavras (token overlap) — pega ordem trocada        */
-/*  3) ML extraído do texto (473ML x 350ML) — se os dois têm ML e é         */
+/*  1) CORRETOR SEVERO de número-disfarçado-de-letra da OCR (ver abaixo) —   */
+/*     roda ANTES de tudo, então os itens 2-5 já trabalham em cima do texto  */
+/*     corrigido.                                                           */
+/*  2) similaridade de string "crua" (Levenshtein) — pega erro de OCR/typo  */
+/*  3) sobreposição de palavras "tolerante" (fuzzy token overlap) — pega     */
+/*     ordem trocada E também 1-2 letras erradas dentro da própria palavra   */
+/*     (ex.: "ITAL4C" ainda conta como "ITALAC")                            */
+/*  4) ML extraído do texto (473ML x 350ML) — se os dois têm ML e é         */
 /*     diferente, penaliza pesado (não é o mesmo item mesmo com nome igual) */
-/*  4) "palavras-variante" (ZERO, DIET, LIGHT, LATA, GARRAFA, PET, LN/LONG  */
+/*  5) "palavras-variante" (ZERO, DIET, LIGHT, LATA, GARRAFA, PET, LN/LONG  */
 /*     NECK, SEM AÇÚCAR, INTEGRAL, DESNATADO...) — se um texto tem e o      */
 /*     outro não, penaliza (evita confundir Coca-Cola com Coca-Cola Zero)   */
 /* ------------------------------------------------------------------------ */
@@ -1055,8 +1067,105 @@ const VARIANT_KEYWORDS = [
   'TRADICIONAL', 'ORIGINAL',
 ];
 
+/* ---- CORRETOR SEVERO: número que a OCR leu como letra parecida ---------- */
+//
+// O problema relatado: a OCR às vezes lê "500ML" como "S00 ML" (o "5" virou
+// "S"), ou "350" como "35O" (o "0" virou "O"). Isso quebra a extração de ML
+// (extractMl não reconhece "S00" como número) e também o casamento por
+// palavra (o token "S00" não bate com "500" no banco).
+//
+// A correção precisa ser CIRÚRGICA — trocar letra por número em QUALQUER
+// lugar do texto seria perigoso: uma marca de cerveja real chamada "SKOL"
+// tem justamente S, O e L, que são 3 das letras mais parecidas com dígito
+// (5, 0, 1)! Se a gente trocasse isso à toa, "SKOL" virava "5K01" e o
+// casamento ficava pior, não melhor. Por isso as regras abaixo SÓ mexem no
+// pedaço de texto que já está grudado numa unidade de medida (ML, L, KG,
+// UN, G) ou num "X" de fardo seguido de dígito — ou seja, só em lugar que
+// já tem certeza absoluta de que ali é pra ser um número. Uma palavra como
+// "SKOL", "SOL", "SAL" etc. nunca aparece colada direto numa unidade desse
+// jeito, então nunca é tocada.
+const OCR_DIGIT_LOOKALIKES = {
+  O: '0', D: '0', Q: '0',
+  I: '1', L: '1',
+  Z: '2',
+  S: '5',
+  G: '6',
+  B: '8',
+  T: '7',
+};
+
+/**
+ * Tenta reescrever um pedaço de texto como se fosse 100% número, trocando
+ * cada letra pelo dígito parecido (O→0, S→5, I→1, etc). "X" passa direto
+ * (é o multiplicador de fardo, tipo "6X350", não é número disfarçado).
+ * Se aparecer QUALQUER letra que não tem um dígito parecido óbvio (tipo A,
+ * C, E, R...), desiste e devolve null — mais seguro não mexer do que
+ * arriscar estragar uma palavra de verdade.
+ */
+function tryFixNumericChunk(chunk) {
+  let rebuilt = '';
+  for (const ch of chunk) {
+    if (/\d/.test(ch) || ch === 'X') {
+      rebuilt += ch;
+      continue;
+    }
+    const swap = OCR_DIGIT_LOOKALIKES[ch];
+    if (swap === undefined) return null;
+    rebuilt += swap;
+  }
+  return rebuilt;
+}
+
+/**
+ * Corretor severo: procura números disfarçados de letra bem perto de uma
+ * unidade de medida ou de um "X" de fardo, e corrige SÓ ali.
+ *   "S00 ML"      -> "500 ML"
+ *   "6X33OML"     -> "6X330ML"
+ *   "AGUA... 5OO L" -> "AGUA... 500 L"   (só corrige com espaço real separando)
+ * Nunca mexe em palavra normal (ver comentário acima do OCR_DIGIT_LOOKALIKES).
+ */
+function fixOcrNumberLookalikes(normalizedText) {
+  let text = normalizedText;
+
+  // 1a) o número do VOLUME, quando vem colado ou perto de unidade de 2+
+  //     letras (ML, KG, UN). Essas são seguras mesmo SEM espaço separando
+  //     (ex.: "6X33OML" -> "6X330ML"), porque não existe palavra comum do
+  //     português que termine exatamente em "ML"/"KG"/"UN".
+  //     Quantificador NÃO-guloso ({1,6}?) é importante: evita que "L"
+  //     (também tratado abaixo) "roube" o M de "ML" durante o backtracking.
+  text = text.replace(/\b([A-Z0-9]{1,6}?)(\s*)(ML|KG|UN)\b/g, (full, chunk, gap, unit) => {
+    const fixed = tryFixNumericChunk(chunk);
+    return fixed ? `${fixed}${gap}${unit}` : full;
+  });
+
+  // 1b) o número do VOLUME perto de unidade de 1 letra só (L de litro, G de
+  //     grama). Essa é BEM mais arriscada: muita palavra comum do
+  //     português termina em "L" ou "G" — inclusive marca de verdade, tipo
+  //     a cerveja "SOL" (S-O-L são justamente 3 letras parecidas com
+  //     número!). Por isso aqui só corrige quando tem um ESPAÇO de verdade
+  //     separando o número da unidade (ex.: "500 L") — nunca quando a letra
+  //     está grudada dentro da própria palavra (protege "SOL", "GOL",
+  //     "MEL" etc. de virarem número por engano).
+  text = text.replace(/\b([A-Z0-9]{1,6}?)(\s+)(L|G)\b/g, (full, chunk, gap, unit) => {
+    const fixed = tryFixNumericChunk(chunk);
+    return fixed ? `${fixed}${gap}${unit}` : full;
+  });
+
+  // Propositalmente NÃO existe uma "parte 2" tentando corrigir a
+  // QUANTIDADE de fardo antes do "X" (tipo "GX350ML" -> "6X350ML"). Testei
+  // e essa ideia parecia boa, mas quebrava um padrão real e comum do banco
+  // de vocês: "1LX12" (1 Litro, fardo com 12) — o "L" ali é uma unidade de
+  // verdade, não um número mal lido, e um corretor de quantidade-antes-do-X
+  // não consegue distinguir com segurança os dois casos. Como o problema
+  // relatado era especificamente no VOLUME (que a regra acima já resolve),
+  // preferi deixar a quantidade de fardo sem correção automática a arriscar
+  // estragar um nome que já estava certo.
+
+  return text;
+}
+
 function normalizeProductText(text) {
-  return (text ?? '')
+  const base = (text ?? '')
     .toString()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '') // remove acentos
@@ -1064,6 +1173,12 @@ function normalizeProductText(text) {
     .replace(/[^A-Z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Corretor severo — só mexe em número disfarçado de letra perto de
+  // unidade/fardo (ver comentário acima). Em texto já limpo (nome cadastrado
+  // no Baserow) isso não faz diferença nenhuma; quem se beneficia é o texto
+  // vindo da OCR da foto.
+  return fixOcrNumberLookalikes(base);
 }
 
 function extractVariantSet(normalizedUpperText) {
@@ -1074,13 +1189,47 @@ function extractVariantSet(normalizedUpperText) {
   return found;
 }
 
+// Quão parecidos dois "tokens" (palavras) precisam ser pra contar como "a
+// mesma palavra" mesmo não sendo idênticos — cobre 1-2 letras erradas pela
+// OCR (ex.: "ITAL4C" ainda bate com "ITALAC", "DESNATAD0" bate com
+// "DESNATADO"). Abaixo desse valor, são tratados como palavras diferentes
+// mesmo (evita, por exemplo, casar "LEITE" com "LEVE").
+const FUZZY_TOKEN_MATCH_THRESHOLD = 0.72;
+
+/**
+ * Sobreposição de palavras "tolerante": em vez de exigir que o token seja
+ * IDÊNTICO pra contar como igual, procura o token mais parecido do outro
+ * lado (Levenshtein) e aceita como igual se a semelhança passar do piso
+ * acima — dando crédito parcial proporcional à semelhança. Isso é o que
+ * deixa o casamento resistente a erro de OCR letra-a-letra dentro da
+ * própria palavra, sem precisar adivinhar QUAL letra está errada.
+ */
 function tokenOverlapScore(a, b) {
-  const tokensA = new Set(a.split(' ').filter((t) => t.length > 1));
-  const tokensB = new Set(b.split(' ').filter((t) => t.length > 1));
-  if (tokensA.size === 0 || tokensB.size === 0) return 0;
-  let shared = 0;
-  for (const t of tokensA) if (tokensB.has(t)) shared += 1;
-  return shared / Math.max(tokensA.size, tokensB.size);
+  const tokensA = a.split(' ').filter((t) => t.length > 1);
+  const tokensB = b.split(' ').filter((t) => t.length > 1);
+  if (tokensA.length === 0 || tokensB.length === 0) return 0;
+
+  const usedB = new Array(tokensB.length).fill(false);
+  let sharedWeight = 0;
+
+  for (const tokenA of tokensA) {
+    let bestIdx = -1;
+    let bestSim = 0;
+    for (let i = 0; i < tokensB.length; i++) {
+      if (usedB[i]) continue;
+      const sim = similarity(tokenA, tokensB[i]);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx !== -1 && bestSim >= FUZZY_TOKEN_MATCH_THRESHOLD) {
+      usedB[bestIdx] = true;
+      sharedWeight += bestSim;
+    }
+  }
+
+  return sharedWeight / Math.max(tokensA.length, tokensB.length);
 }
 
 /**
@@ -1139,6 +1288,325 @@ async function findBestMatchByProductText(recognizedText) {
     return { found: false, score: bestScore < 0 ? null : bestScore, product: null };
   }
   return { found: true, score: bestScore, product: best };
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — 2ª CAMADA: IA CORRETORA DE OCR (Groq)                 */
+/*                                                                            */
+/* Quando o casamento direto acima (regras + fuzzy) NÃO acha nada com        */
+/* confiança, é sinal de que a OCR provavelmente leu o rótulo bagunçado      */
+/* demais (sílaba grudada/separada errado, letra trocada por número, palavra */
+/* cortada na borda da foto etc). Antes de desistir, a gente manda esse      */
+/* texto cru pra uma IA (Groq/Llama) e pede a MELHOR TENTATIVA do nome real  */
+/* do produto por trás daquela bagunça — é basicamente "pensar em cima do    */
+/* que a OCR encontrou e corrigir", como você pediu. Se a IA falhar por      */
+/* qualquer motivo, devolve null e quem chamou ignora essa camada.           */
+/* ------------------------------------------------------------------------ */
+
+const OCR_FIX_SYSTEM_PROMPT = [
+  'Você recebe um texto bagunçado, extraído por OCR de uma foto de rótulo',
+  'de produto de supermercado brasileiro. A OCR comete erros típicos: troca',
+  'letra por número parecido (O/0, S/5, I/1, B/8), junta duas palavras que',
+  'deveriam estar separadas, separa uma palavra no meio por engano, corta',
+  'palavra na borda da foto, ou lê símbolo/ruído como se fosse letra.',
+  'Sua tarefa: adivinhar o nome REAL do produto (categoria + marca +',
+  'variante/sabor/tipo), corrigindo esses erros. Regras:',
+  '1. Responda SÓ com o nome corrigido, em maiúsculas, sem aspas, sem',
+  '   explicação, sem comentário, sem ponto final.',
+  '2. NUNCA inclua volume/peso (L, ML, KG, G) nem quantidade de fardo — não',
+  '   é sua tarefa corrigir número, só o nome.',
+  '3. Se o texto estiver curto ou confuso demais pra ter certeza de nada,',
+  '   responda exatamente NAO_SEI (é melhor admitir do que inventar marca).',
+  '4. NUNCA invente marca/sabor que não tenha nenhuma pista no texto',
+  '   original — corrija a grafia, não invente produto novo.',
+].join('\n');
+
+async function correctOcrTextWithAI(recognizedText) {
+  const text = (recognizedText ?? '').trim();
+  if (!text) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        temperature: 0.2,
+        max_tokens: 40,
+        messages: [
+          { role: 'system', content: OCR_FIX_SYSTEM_PROMPT },
+          {
+            role: 'user',
+            content: `Texto lido pela OCR: "${text}"\n\nResponda só com o nome corrigido, ou NAO_SEI.`,
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const raw = data?.choices?.[0]?.message?.content?.trim();
+    if (!raw) return null;
+
+    const cleaned = raw.replace(/^["'“”]+|["'“”.]+$/g, '').trim().toUpperCase();
+    if (!cleaned || cleaned === 'NAO_SEI' || cleaned.length > 60) return null;
+
+    return cleaned;
+  } catch {
+    return null; // sem internet, timeout, chave inválida, limite estourado etc.
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — 2ª CAMADA: CONFERÊNCIA EM TEMPO REAL NA WEB (SerpApi)  */
+/*                                                                            */
+/* Pega o texto lido (ou já corrigido pela IA acima) e faz uma busca de       */
+/* verdade no Google via SerpApi — como se você mesmo colasse a descrição    */
+/* lá e conferisse o que aparece. Serve pra duas coisas:                     */
+/*  1) Se algum resultado trouxer um código de barras (GTIN) na página,      */
+/*     esse é o sinal mais forte possível — daí a gente tenta achar esse     */
+/*     produto direto no Baserow (e, se quiser evoluir depois, no Cosmos     */
+/*     também, exatamente como se tivesse bipado o código de verdade).       */
+/*  2) Usa o título dos resultados como candidatos extras de "nome real do   */
+/*     produto" pra testar contra o catálogo do Baserow.                     */
+/* Se a busca falhar (sem internet, chave inválida, sem resultado), devolve  */
+/* null — nunca trava o app nem impede as outras camadas de funcionar.       */
+/* ------------------------------------------------------------------------ */
+
+const SERPAPI_URL = 'https://serpapi.com/search.json';
+const SERPAPI_TIMEOUT_MS = 8000;
+
+/** Acha o primeiro número de 8, 12, 13 ou 14 dígitos no texto (GTIN típico). */
+function extractGtinFromText(text) {
+  const match = (text ?? '').match(/\b\d{13}\b|\b\d{14}\b|\b\d{12}\b|\b\d{8}\b/);
+  return match ? match[0] : null;
+}
+
+async function searchProductOnWeb(query) {
+  const q = (query ?? '').trim();
+  if (!q || !SERPAPI_API_KEY) return null;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
+
+  try {
+    const params = new URLSearchParams({
+      engine: 'google',
+      q: `${q} código de barras produto supermercado`,
+      hl: 'pt-br',
+      gl: 'br',
+      num: '5',
+      api_key: SERPAPI_API_KEY,
+    });
+    const res = await fetch(`${SERPAPI_URL}?${params.toString()}`, { signal: controller.signal });
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const organic = Array.isArray(data.organic_results) ? data.organic_results : [];
+    if (organic.length === 0) return null;
+
+    const combinedText = organic.map((r) => `${r.title ?? ''} ${r.snippet ?? ''}`).join(' ');
+    const gtin = extractGtinFromText(combinedText);
+
+    // Candidato de nome: título do primeiro resultado, cortando o pedaço
+    // depois de "-" ou "|" (normalmente é o nome do site/loja, não o produto).
+    const rawTitle = organic[0]?.title ?? '';
+    const candidateName = rawTitle.split(/[-|]/)[0].trim() || null;
+
+    return {
+      candidateName,
+      gtin,
+      titles: organic.slice(0, 3).map((r) => r.title).filter(Boolean),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — 3ª CAMADA (ÚLTIMO RECURSO): CASAMENTO POR SÍLABA       */
+/*                                                                            */
+/* O casamento por PALAVRA (tokenOverlapScore, mais acima) já resolve letra  */
+/* errada dentro da palavra. O que ele NÃO resolve bem é quando a OCR junta  */
+/* ou separa palavras no lugar errado — tipo ler "COCA COLA" como            */
+/* "COCACOLA" (uma palavra só) ou "COC ACOLA" (cortada no lugar errado). Em  */
+/* nenhum dos dois casos o token bate certinho com "COCA" e "COLA" do        */
+/* Baserow. Quebrando em SÍLABAS em vez de em PALAVRAS, o pedaço "COCA" e o  */
+/* pedaço "COLA" continuam existindo soltos dentro do texto, não importa    */
+/* onde a OCR colocou o espaço — e o casamento continua funcionando.         */
+/* Por isso essa camada só entra como ÚLTIMO recurso: sozinha ela é mais     */
+/* "solta" que o casamento por palavra (mais chance de falso positivo).      */
+/* ------------------------------------------------------------------------ */
+
+const VOWELS_PT = 'AEIOU';
+
+/** Divide uma palavra em sílabas por um critério simples (vogal-consoante). */
+function syllabifyWord(word) {
+  const w = (word ?? '').toUpperCase();
+  const syllables = [];
+  let current = '';
+  for (let i = 0; i < w.length; i++) {
+    current += w[i];
+    const thisIsVowel = VOWELS_PT.includes(w[i]);
+    const nextIsConsonant = i + 1 < w.length && !VOWELS_PT.includes(w[i + 1]);
+    const afterNextIsVowel = i + 2 < w.length && VOWELS_PT.includes(w[i + 2]);
+    // Fecha a sílaba num padrão VOGAL + CONSOANTE + VOGAL (a consoante do
+    // meio "puxa" pra sílaba seguinte) — corta ANTES da consoante.
+    if (thisIsVowel && nextIsConsonant && afterNextIsVowel) {
+      syllables.push(current);
+      current = '';
+    }
+  }
+  if (current) syllables.push(current);
+  return syllables.length ? syllables : [w];
+}
+
+/** Sobreposição "tolerante" (igual tokenOverlapScore), mas em SÍLABAS. */
+function syllableOverlapScore(a, b) {
+  const syllablesA = a.split(' ').filter(Boolean).flatMap(syllabifyWord).filter((s) => s.length >= 2);
+  const syllablesB = b.split(' ').filter(Boolean).flatMap(syllabifyWord).filter((s) => s.length >= 2);
+  if (syllablesA.length === 0 || syllablesB.length === 0) return 0;
+
+  const usedB = new Array(syllablesB.length).fill(false);
+  let sharedWeight = 0;
+  for (const sylA of syllablesA) {
+    let bestIdx = -1;
+    let bestSim = 0;
+    for (let i = 0; i < syllablesB.length; i++) {
+      if (usedB[i]) continue;
+      const sim = similarity(sylA, syllablesB[i]);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx !== -1 && bestSim >= FUZZY_TOKEN_MATCH_THRESHOLD) {
+      usedB[bestIdx] = true;
+      sharedWeight += bestSim;
+    }
+  }
+  return sharedWeight / Math.max(syllablesA.length, syllablesB.length);
+}
+
+const SYLLABLE_SUGGESTION_THRESHOLD = 0.55;
+
+function productSyllableSimilarity(rawA, rawB) {
+  const upperA = normalizeProductText(rawA);
+  const upperB = normalizeProductText(rawB);
+  if (!upperA || !upperB) return 0;
+
+  let score = syllableOverlapScore(upperA, upperB);
+
+  // Mesmas penalidades de ML/variante do casamento por palavra — continua
+  // não podendo confundir "COCA-COLA" com "COCA-COLA ZERO" só porque as
+  // sílabas batem.
+  const mlA = extractMl(upperA);
+  const mlB = extractMl(upperB);
+  if (mlA !== null && mlB !== null && mlA !== mlB) score *= 0.35;
+
+  const variantsA = extractVariantSet(upperA);
+  const variantsB = extractVariantSet(upperB);
+  const onlyInA = [...variantsA].filter((v) => !variantsB.has(v));
+  const onlyInB = [...variantsB].filter((v) => !variantsA.has(v));
+  if (onlyInA.length > 0 || onlyInB.length > 0) score *= 0.55;
+
+  return Math.max(0, Math.min(1, score));
+}
+
+async function findBestMatchBySyllable(recognizedText) {
+  const rows = await listAllProductsCached();
+  let best = null;
+  let bestScore = -1;
+  for (const row of rows) {
+    if (!row.produto) continue;
+    const score = productSyllableSimilarity(recognizedText, row.produto);
+    if (score > bestScore) {
+      bestScore = score;
+      best = row;
+    }
+  }
+  if (!best || bestScore < SYLLABLE_SUGGESTION_THRESHOLD) {
+    return { found: false, score: bestScore < 0 ? null : bestScore, product: null };
+  }
+  return { found: true, score: bestScore, product: best };
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — ORQUESTRADOR: junta as 3 camadas numa função só         */
+/*                                                                            */
+/* Ordem de tentativa (só avança pra próxima camada se a anterior não achou   */
+/* nada com confiança — assim não gasta IA/internet à toa na maioria das     */
+/* fotos, que já batem de primeira):                                         */
+/*   1. Casamento direto (regras + fuzzy por palavra) — findBestMatchByProductText */
+/*   2. IA corretora (Groq) + busca real na web (SerpApi), em paralelo:      */
+/*      - se a web achou um código de barras na página, tenta esse código    */
+/*        direto no Baserow (igual a ter bipado o código de verdade);        */
+/*      - testa cada candidato de nome (original, IA, títulos da web) contra */
+/*        o Baserow e fica com o de maior score.                            */
+/*   3. Último recurso: casamento por SÍLABA (original e/ou versão da IA).   */
+/* Devolve sempre { found, score, product, stage }, onde "stage" diz qual    */
+/* camada resolveu — útil pra mostrar na tela como o produto foi achado.     */
+/* ------------------------------------------------------------------------ */
+
+async function enrichRecognizedText(recognizedText) {
+  const direct = await findBestMatchByProductText(recognizedText);
+  if (direct.found && direct.score >= 0.75) {
+    return { ...direct, stage: 'direto' };
+  }
+
+  const [aiGuess, webResult] = await Promise.all([
+    correctOcrTextWithAI(recognizedText),
+    searchProductOnWeb(recognizedText),
+  ]);
+
+  // Sinal mais forte: a web trouxe um código de barras de verdade na página.
+  if (webResult?.gtin) {
+    const byCodigo = await findProductByCodigo(webResult.gtin);
+    if (byCodigo) return { found: true, score: 1, product: byCodigo, stage: 'ean-web' };
+  }
+
+  const candidates = [
+    { text: recognizedText, stage: 'direto' },
+    { text: aiGuess, stage: 'ia-ocr' },
+    { text: webResult?.candidateName, stage: 'busca-web' },
+    ...((webResult?.titles ?? []).map((t) => ({ text: t, stage: 'busca-web' }))),
+  ].filter((c) => c.text);
+
+  let best = direct.found ? direct : { found: false, score: direct.score, product: null };
+  let bestStage = 'direto';
+  for (const candidate of candidates) {
+    const attempt = await findBestMatchByProductText(candidate.text);
+    if (attempt.found && (!best.found || attempt.score > best.score)) {
+      best = attempt;
+      bestStage = candidate.stage;
+    }
+  }
+  if (best.found) return { ...best, stage: bestStage };
+
+  // Último recurso: casamento por sílaba (texto original e versão da IA).
+  const syllableCandidates = [recognizedText, aiGuess].filter(Boolean);
+  let bestSyllable = { found: false, score: null, product: null };
+  for (const text of syllableCandidates) {
+    const attempt = await findBestMatchBySyllable(text);
+    if (attempt.found && (!bestSyllable.found || attempt.score > bestSyllable.score)) {
+      bestSyllable = attempt;
+    }
+  }
+  if (bestSyllable.found) return { ...bestSyllable, stage: 'silaba' };
+
+  return { found: false, score: direct.score, product: null, stage: 'nenhum' };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1287,6 +1755,17 @@ const OCR_MIN_TEXT_LENGTH = 3;
 
 const isSmartModeSupported = !!isTextExtractorSupported;
 
+// Texto exibido pra explicar COMO o produto foi encontrado (ver
+// enrichRecognizedText). "direto" não mostra nada — foi achado na hora, sem
+// precisar de reforço nenhum.
+const STAGE_LABELS = {
+  direto: null,
+  'ia-ocr': 'Corrigido por IA',
+  'busca-web': 'Confirmado por busca na web',
+  'ean-web': 'Código de barras achado na web',
+  silaba: 'Casamento por sílaba',
+};
+
 function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, suggestProductByText }) {
   const insets = useSafeAreaInsets();
   const [permission, requestPermission] = useCameraPermissions();
@@ -1372,6 +1851,7 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
           ml: best.ml ?? null,
           quantidade: best.quantidade ?? null,
           score: best.score ?? null,
+          stage: best.stage ?? null,
         });
       } else {
         setSuggestion({ phase: 'notfound', recognizedText });
@@ -1593,6 +2073,11 @@ function ScannerScreen({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, su
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
                 </Text>
+                {STAGE_LABELS[suggestion.stage] && (
+                  <View style={[styles.suggestionTag, { alignSelf: 'flex-start', backgroundColor: colors.secondary }]}>
+                    <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
+                  </View>
+                )}
                 <View style={styles.suggestionProduct}>
                   <Text style={styles.suggestionProductName}>{suggestion.produto}</Text>
                   {suggestion.preco !== null && suggestion.preco !== undefined && (
@@ -2271,7 +2756,10 @@ export default function App() {
   // produto já cadastrado no Baserow (considerando ML e variante — ver
   // findBestMatchByProductText). Não usa código de barras nenhum.
   const suggestProductByText = useCallback(async (recognizedText) => {
-    const match = await findBestMatchByProductText(recognizedText);
+    // enrichRecognizedText tenta, em ordem: casamento direto → IA corretora
+    // de OCR + busca real na web (SerpApi) → casamento por sílaba. Só avança
+    // pra próxima camada se a anterior não achou nada com confiança.
+    const match = await enrichRecognizedText(recognizedText);
     return {
       found: match.found,
       codigo: match.product?.codigo ?? null,
@@ -2280,6 +2768,7 @@ export default function App() {
       ml: match.product?.ml ?? null,
       quantidade: match.product?.quantidade ?? null,
       score: match.score,
+      stage: match.stage,
     };
   }, []);
 
