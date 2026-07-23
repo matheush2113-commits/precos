@@ -29,7 +29,10 @@
     "@expo-google-fonts/inter": "*",
     "expo-splash-screen": "~31.0.13",
     "expo-text-extractor": "*",
-    "expo-build-properties": "~57.0.6"
+    "expo-build-properties": "~57.0.6",
+    "react-native-vision-camera": "4.7.3",
+    "@bear-block/vision-camera-ocr": "^4.0.0",
+    "react-native-worklets-core": "^1.6.3"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2"
