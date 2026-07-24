@@ -2189,13 +2189,22 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
 
   const frameProcessor = useVCFrameProcessor((frame) => {
     'worklet';
+    // IMPORTANTE: nada de `?.` (optional chaining) nem `??` (nullish
+    // coalescing) aqui dentro. Essas sintaxes fazem o Babel criar variáveis
+    // temporárias por baixo dos panos, e quando o worklets-core recompila
+    // essa função sozinha (pra rodar isolada na thread da câmera), essa
+    // variável temporária pode ficar "órfã" — foi o que causou o crash
+    // "Property '_payload$blocks' doesn't exist" na primeira tentativa.
+    // Por isso tudo abaixo é escrito com verificação manual (if/ternário),
+    // mesmo sendo mais verboso.
     if (!runOcrResultOnJS) return;
     const raw = scanOCR(frame);
+    if (!raw) return;
+
     // Formatos diferentes de plugin de OCR embrulham o resultado de jeitos
-    // diferentes ({text, blocks} direto, ou {result: {text, blocks}}) —
-    // lê os dois pra não depender de acertar exatamente a versão instalada.
-    const payload = raw?.result ?? raw;
-    const text = payload?.text;
+    // diferentes ({text, blocks} direto, ou {result: {text, blocks}}).
+    const payload = raw.result ? raw.result : raw;
+    const text = payload && payload.text ? payload.text : null;
     if (!text) return;
 
     // Achata blocks → lines → box num array simples de retângulos, só com o
@@ -2204,15 +2213,21 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     // vezes como {left,top,width,height} — calcula o que faltar a partir do
     // que tiver, em vez de assumir um formato só.
     const boxes = [];
-    for (const block of payload?.blocks ?? []) {
-      for (const line of block.lines ?? block.elements ?? []) {
-        const box = line.box ?? line.boundingBox ?? line.frame;
+    const blocks = payload && payload.blocks ? payload.blocks : [];
+    for (let bi = 0; bi < blocks.length; bi++) {
+      const block = blocks[bi];
+      const lines = block.lines ? block.lines : (block.elements ? block.elements : []);
+      for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        const box = line.box ? line.box : (line.boundingBox ? line.boundingBox : line.frame);
         if (box) {
-          const left = box.left ?? box.x ?? 0;
-          const top = box.top ?? box.y ?? 0;
-          const width = box.width ?? (box.right !== undefined ? box.right - left : 0);
-          const height = box.height ?? (box.bottom !== undefined ? box.bottom - top : 0);
-          boxes.push({ left, top, width, height });
+          const left = box.left !== undefined ? box.left : (box.x !== undefined ? box.x : 0);
+          const top = box.top !== undefined ? box.top : (box.y !== undefined ? box.y : 0);
+          let width = box.width !== undefined ? box.width : 0;
+          let height = box.height !== undefined ? box.height : 0;
+          if (!width && box.right !== undefined) width = box.right - left;
+          if (!height && box.bottom !== undefined) height = box.bottom - top;
+          boxes.push({ left: left, top: top, width: width, height: height });
         }
       }
     }
