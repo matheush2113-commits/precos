@@ -2189,6 +2189,15 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
 
   const frameProcessor = useVCFrameProcessor((frame) => {
     'worklet';
+    // IMPORTANTE: o Frame da câmera só é válido durante este processamento —
+    // assim que scanOCR(frame) termina, o plugin pode fechar/invalidar o
+    // frame por baixo dos panos. Por isso frame.width/frame.height têm que
+    // ser lidos JÁ, antes de mais nada, e guardados em variável comum. Ler
+    // eles DEPOIS de chamar scanOCR foi o que causou o erro
+    // "Trying to access an already closed Frame".
+    const frameWidth = frame.width;
+    const frameHeight = frame.height;
+
     // IMPORTANTE: nada de `?.` (optional chaining) nem `??` (nullish
     // coalescing) aqui dentro. Essas sintaxes fazem o Babel criar variáveis
     // temporárias por baixo dos panos, e quando o worklets-core recompila
@@ -2232,7 +2241,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
       }
     }
 
-    runOcrResultOnJS(text, boxes, frame.width, frame.height);
+    runOcrResultOnJS(text, boxes, frameWidth, frameHeight);
   }, [runOcrResultOnJS]);
 
   const handlePreviewLayout = useCallback((event) => {
