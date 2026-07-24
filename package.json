@@ -31,7 +31,7 @@
     "expo-text-extractor": "*",
     "expo-build-properties": "~57.0.6",
     "react-native-vision-camera": "4.7.3",
-    "@bear-block/vision-camera-ocr": "^4.0.0",
+    "vision-camera-ocr-plugin": "^3.0.24",
     "react-native-worklets-core": "^1.6.3"
   },
   "devDependencies": {
