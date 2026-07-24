@@ -52,7 +52,7 @@ sempre ligada, lendo cada frame, sem tirar foto nenhuma — em vez do "loop de
 foto automática" que já funciona), precisa instalar mais 3 pacotes nativos e
 reconstruir o app. Passo a passo:
   1. npx expo install react-native-vision-camera react-native-worklets-core
-     npm install @bear-block/vision-camera-ocr
+     npm install vision-camera-ocr-plugin
   2. No app.json/app.config.js, adicione o config plugin do vision-camera
      dentro de "plugins":
        ["react-native-vision-camera", {
@@ -167,22 +167,22 @@ try {
 /* fica `false` e o app cai de volta pro modo Inteligente "de loop" que já   */
 /* tínhamos (ScannerScreenLegacy, sem mudar nada nele) — nunca crasha.       */
 let VisionCamera = null;
-let performOcr = null;
+let scanOCR = null;
 let Worklets = null;
 let isVisionCameraSupported = false;
 try {
   // eslint-disable-next-line global-require
   VisionCamera = require('react-native-vision-camera');
   // eslint-disable-next-line global-require
-  const ocrPluginModule = require('@bear-block/vision-camera-ocr');
-  performOcr = ocrPluginModule.performOcr;
+  const ocrPluginModule = require('vision-camera-ocr-plugin');
+  scanOCR = ocrPluginModule.scanOCR;
   // eslint-disable-next-line global-require
   const workletsModule = require('react-native-worklets-core');
   Worklets = workletsModule.Worklets;
-  isVisionCameraSupported = !!(VisionCamera && VisionCamera.Camera && typeof performOcr === 'function' && Worklets);
+  isVisionCameraSupported = !!(VisionCamera && VisionCamera.Camera && typeof scanOCR === 'function' && Worklets);
 } catch (e) {
   VisionCamera = null;
-  performOcr = null;
+  scanOCR = null;
   Worklets = null;
   isVisionCameraSupported = false;
 }
@@ -2190,29 +2190,34 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   const frameProcessor = useVCFrameProcessor((frame) => {
     'worklet';
     if (!runOcrResultOnJS) return;
-    const result = performOcr(frame);
-    if (!result?.text) return;
+    const raw = scanOCR(frame);
+    // Formatos diferentes de plugin de OCR embrulham o resultado de jeitos
+    // diferentes ({text, blocks} direto, ou {result: {text, blocks}}) —
+    // lê os dois pra não depender de acertar exatamente a versão instalada.
+    const payload = raw?.result ?? raw;
+    const text = payload?.text;
+    if (!text) return;
 
     // Achata blocks → lines → box num array simples de retângulos, só com o
-    // que o overlay precisa (left/top/width/height). Aceita tanto `box`
-    // quanto `boundingBox` como nome do campo, porque isso varia um pouco
-    // entre versão do plugin.
+    // que o overlay precisa (left/top/width/height). A caixa delimitadora do
+    // MLKit às vezes vem como {left,top,right,bottom} (Android Rect) e às
+    // vezes como {left,top,width,height} — calcula o que faltar a partir do
+    // que tiver, em vez de assumir um formato só.
     const boxes = [];
-    for (const block of result.blocks ?? []) {
-      for (const line of block.lines ?? []) {
-        const box = line.box ?? line.boundingBox;
+    for (const block of payload?.blocks ?? []) {
+      for (const line of block.lines ?? block.elements ?? []) {
+        const box = line.box ?? line.boundingBox ?? line.frame;
         if (box) {
-          boxes.push({
-            left: box.left ?? box.x ?? 0,
-            top: box.top ?? box.y ?? 0,
-            width: box.width ?? 0,
-            height: box.height ?? 0,
-          });
+          const left = box.left ?? box.x ?? 0;
+          const top = box.top ?? box.y ?? 0;
+          const width = box.width ?? (box.right !== undefined ? box.right - left : 0);
+          const height = box.height ?? (box.bottom !== undefined ? box.bottom - top : 0);
+          boxes.push({ left, top, width, height });
         }
       }
     }
 
-    runOcrResultOnJS(result.text, boxes, frame.width, frame.height);
+    runOcrResultOnJS(text, boxes, frame.width, frame.height);
   }, [runOcrResultOnJS]);
 
   const handlePreviewLayout = useCallback((event) => {
