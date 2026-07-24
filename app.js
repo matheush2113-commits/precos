@@ -638,6 +638,38 @@ function isMilkDescription(descriptionUpper) {
  * achar nenhum padrão — nesse caso productTextSimilarity simplesmente ignora
  * esse sinal (não penaliza nem bonifica).
  */
+/**
+ * Acha um PREÇO no texto lido (OCR da etiqueta) — formato brasileiro "R$
+ * 5,87", "R$5,87" ou até só "5,87" perto de "R$" em outra linha. Etiqueta de
+ * supermercado quase sempre tem o preço no formato vírgula + 2 casas, então
+ * o regex exige exatamente isso (evita confundir com código de barras, peso
+ * em gramas, ou outro número solto na foto). Devolve um número (5.87) ou
+ * null se não achar nada com essa cara.
+ */
+function extractPriceFromText(text) {
+  const upper = (text ?? '').toString().toUpperCase();
+
+  // Prioridade 1: "R$" bem coladinho no número — é o caso mais confiável,
+  // porque é literalmente assim que preço aparece impresso na etiqueta.
+  const withSymbol = upper.match(/R\$\s*(\d{1,4}(?:\.\d{3})*,\d{2})\b/);
+  if (withSymbol) return parseBRLNumber(withSymbol[1]);
+
+  // Prioridade 2 (mais arriscada): número solto no formato X,XX sem o "R$"
+  // do lado — só usa se for o ÚNICO candidato nesse formato no texto todo,
+  // pra não arriscar pegar o número errado quando há mais de um.
+  const bareMatches = upper.match(/\b\d{1,4}(?:\.\d{3})*,\d{2}\b/g);
+  if (bareMatches && bareMatches.length === 1) return parseBRLNumber(bareMatches[0]);
+
+  return null;
+}
+
+/** Converte "1.234,56" ou "5,87" (formato brasileiro) pro número 1234.56 / 5.87. */
+function parseBRLNumber(value) {
+  const normalized = value.replace(/\./g, '').replace(',', '.');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function extractPackQuantityFromText(text) {
   const upper = (text ?? '').toString();
   // Formato do catálogo é sempre "QUANTIDADE X VOLUME" grudado, tipo
@@ -2037,26 +2069,47 @@ const LIVE_BOX_THROTTLE_MS = 120;
  */
 function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
   if (!boxes || boxes.length === 0 || !frameWidth || !frameHeight || !previewSize.width) return null;
-  const scaleX = previewSize.width / frameWidth;
-  const scaleY = previewSize.height / frameHeight;
+
+  // A câmera quase sempre entrega o frame "deitado" (largura > altura), no
+  // sentido do sensor físico, mesmo com o celular na posição vertical — mas
+  // a pré-visualização na tela é vertical (altura > largura). Se a gente
+  // escalar direto sem considerar isso, as caixinhas saem giradas/fora do
+  // lugar. Detecta a rotação comparando a "forma" dos dois (deitado vs em
+  // pé) e, se forem opostas, gira as coordenadas 90° antes de escalar.
+  const frameIsLandscape = frameWidth > frameHeight;
+  const previewIsPortrait = previewSize.height > previewSize.width;
+  const needsRotation = frameIsLandscape === previewIsPortrait;
+  const effectiveFrameWidth = needsRotation ? frameHeight : frameWidth;
+  const effectiveFrameHeight = needsRotation ? frameWidth : frameHeight;
+  const scaleX = previewSize.width / effectiveFrameWidth;
+  const scaleY = previewSize.height / effectiveFrameHeight;
+
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      {boxes.map((box, index) => (
-        <View
-          key={index}
-          style={{
-            position: 'absolute',
-            left: box.left * scaleX,
-            top: box.top * scaleY,
-            width: box.width * scaleX,
-            height: box.height * scaleY,
-            borderWidth: 2,
-            borderColor: '#06b6d4',
-            borderRadius: 4,
-            backgroundColor: 'rgba(6,182,212,0.12)',
-          }}
-        />
-      ))}
+      {boxes.map((box, index) => {
+        // Girando 90°, o eixo X do frame vira o eixo Y da tela (e vice
+        // versa) — por isso left/top e width/height trocam de par aqui.
+        const left = needsRotation ? box.top : box.left;
+        const top = needsRotation ? box.left : box.top;
+        const width = needsRotation ? box.height : box.width;
+        const height = needsRotation ? box.width : box.height;
+        return (
+          <View
+            key={index}
+            style={{
+              position: 'absolute',
+              left: left * scaleX,
+              top: top * scaleY,
+              width: width * scaleX,
+              height: height * scaleY,
+              borderWidth: 2,
+              borderColor: '#06b6d4',
+              borderRadius: 4,
+              backgroundColor: 'rgba(6,182,212,0.12)',
+            }}
+          />
+        );
+      })}
     </View>
   );
 }
@@ -2167,6 +2220,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
             matchedCodigo: best.codigo ?? null,
             produto: best.produto,
             preco: best.preco ?? null,
+            precoDetectado: extractPriceFromText(trimmed),
             ml: best.ml ?? null,
             quantidade: best.quantidade ?? null,
             score: best.score ?? null,
@@ -2385,9 +2439,25 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                   <ConfidenceBar score={suggestion.score} dark={false} />
                 </View>
                 <View style={styles.suggestionProduct}>
-                  <Text style={styles.suggestionProductName}>{suggestion.produto}</Text>
-                  {suggestion.preco !== null && suggestion.preco !== undefined && (
-                    <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.preco)}</Text>
+                  <Text style={styles.suggestionProductName} numberOfLines={2} ellipsizeMode="tail">{suggestion.produto}</Text>
+                  {suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined ? (
+                    <>
+                      <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
+                        <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.precoDetectado)}</Text>
+                        <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, backgroundColor: 'rgba(16,185,129,0.14)' }}>
+                          <Text style={{ fontSize: 10, color: colors.success, fontFamily: 'Inter_700Bold' }}>LIDO NA ETIQUETA</Text>
+                        </View>
+                      </View>
+                      {suggestion.preco !== null && suggestion.preco !== undefined && Math.abs(suggestion.preco - suggestion.precoDetectado) > 0.001 && (
+                        <Text style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_500Medium', marginTop: 2 }}>
+                          Preço salvo no sistema: {formatBRL(suggestion.preco)} {suggestion.precoDetectado > suggestion.preco ? '↑ subiu' : '↓ baixou'}
+                        </Text>
+                      )}
+                    </>
+                  ) : (
+                    suggestion.preco !== null && suggestion.preco !== undefined && (
+                      <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.preco)}</Text>
+                    )
                   )}
                   {(suggestion.ml || suggestion.quantidade) && (
                     <Text style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_500Medium', marginTop: 2 }}>
@@ -2398,10 +2468,10 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                   )}
                 </View>
                 <View style={styles.suggestionActions}>
-                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null)}>
+                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}>
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
                   </Pressable>
-                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(suggestion.matchedCodigo)}>
+                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado })}>
                     <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
                       <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>É este produto</Text>
                     </LinearGradient>
@@ -2511,13 +2581,14 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
           matchedCodigo: best.codigo ?? null,
           produto: best.produto,
           preco: best.preco ?? null,
+          precoDetectado: extractPriceFromText(recognizedText),
           ml: best.ml ?? null,
           quantidade: best.quantidade ?? null,
           score: best.score ?? null,
           stage: best.stage ?? null,
         });
       } else {
-        setSuggestion({ phase: 'notfound', recognizedText });
+        setSuggestion({ phase: 'notfound', recognizedText, precoDetectado: extractPriceFromText(recognizedText) });
       }
     } catch {
       setSuggestion({ phase: 'notfound', recognizedText: '' });
@@ -2574,6 +2645,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
           matchedCodigo: best.codigo ?? null,
           produto: best.produto,
           preco: best.preco ?? null,
+          precoDetectado: extractPriceFromText(recognizedText),
           ml: best.ml ?? null,
           quantidade: best.quantidade ?? null,
           score: best.score ?? null,
@@ -2782,11 +2854,19 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Tente tirar a foto de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
+                {suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined && (
+                  <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
+                    <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.precoDetectado)}</Text>
+                    <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, backgroundColor: 'rgba(16,185,129,0.14)' }}>
+                      <Text style={{ fontSize: 10, color: colors.success, fontFamily: 'Inter_700Bold' }}>LIDO NA ETIQUETA</Text>
+                    </View>
+                  </View>
+                )}
                 <View style={styles.suggestionActions}>
                   <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => setSuggestion(null)}>
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Tentar de novo</Text>
                   </Pressable>
-                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(null)}>
+                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}>
                     <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
                       <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>Cadastrar manualmente</Text>
                     </LinearGradient>
@@ -2810,9 +2890,25 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                   <ConfidenceBar score={suggestion.score} dark={false} />
                 </View>
                 <View style={styles.suggestionProduct}>
-                  <Text style={styles.suggestionProductName}>{suggestion.produto}</Text>
-                  {suggestion.preco !== null && suggestion.preco !== undefined && (
-                    <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.preco)}</Text>
+                  <Text style={styles.suggestionProductName} numberOfLines={2} ellipsizeMode="tail">{suggestion.produto}</Text>
+                  {suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined ? (
+                    <>
+                      <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
+                        <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.precoDetectado)}</Text>
+                        <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, backgroundColor: 'rgba(16,185,129,0.14)' }}>
+                          <Text style={{ fontSize: 10, color: colors.success, fontFamily: 'Inter_700Bold' }}>LIDO NA ETIQUETA</Text>
+                        </View>
+                      </View>
+                      {suggestion.preco !== null && suggestion.preco !== undefined && Math.abs(suggestion.preco - suggestion.precoDetectado) > 0.001 && (
+                        <Text style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_500Medium', marginTop: 2 }}>
+                          Preço salvo no sistema: {formatBRL(suggestion.preco)} {suggestion.precoDetectado > suggestion.preco ? '↑ subiu' : '↓ baixou'}
+                        </Text>
+                      )}
+                    </>
+                  ) : (
+                    suggestion.preco !== null && suggestion.preco !== undefined && (
+                      <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.preco)}</Text>
+                    )
                   )}
                   {(suggestion.ml || suggestion.quantidade) && (
                     <Text style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_500Medium', marginTop: 2 }}>
@@ -2825,13 +2921,13 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                 <View style={styles.suggestionActions}>
                   <Pressable
                     style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]}
-                    onPress={() => goToConfirm(null)}
+                    onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}
                   >
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
                   </Pressable>
                   <Pressable
                     style={{ flex: 1 }}
-                    onPress={() => goToConfirm(suggestion.matchedCodigo)}
+                    onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado })}
                   >
                     <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
                       <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>É este produto</Text>
@@ -2902,9 +2998,17 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
       setCodigoInput(data.codigo || codigo || '');
       setMlInput(data.ml !== null && data.ml !== undefined ? String(data.ml) : '');
       setQuantidadeInput(data.quantidade !== null && data.quantidade !== undefined ? String(data.quantidade) : '');
-      if (data.preco !== null && data.preco !== undefined) setDigits(Math.round(data.preco * 100).toString());
+      // Prioriza o preço LIDO AGORA na etiqueta (params.precoDetectado) sobre
+      // o preço que já estava salvo no sistema — é justamente pra isso que o
+      // Modo Inteligente serve: conferir/atualizar o preço pra bater com o
+      // que está impresso na prateleira agora, não repetir o valor antigo.
+      const precoParaPreencher =
+        params.precoDetectado !== null && params.precoDetectado !== undefined ? params.precoDetectado : data.preco;
+      if (precoParaPreencher !== null && precoParaPreencher !== undefined) {
+        setDigits(Math.round(precoParaPreencher * 100).toString());
+      }
     }
-  }, [data, codigo]);
+  }, [data, codigo, params.precoDetectado]);
 
   const handleKeyPress = (key) => {
     if (key === 'del') { setDigits((d) => d.slice(0, -1)); return; }
@@ -3150,7 +3254,16 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
                 <Text style={styles.previousPriceValue}>{formatCentsBuffer(String(Math.round(data.preco * 100)))}</Text>
               </View>
             )}
-            <Text style={[styles.priceLabel, isEditing && { color: 'rgba(43,29,0,0.6)' }]}>{isEditing ? 'Novo preço' : 'Preço'}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <Text style={[styles.priceLabel, isEditing && { color: 'rgba(43,29,0,0.6)' }]}>{isEditing ? 'Novo preço' : 'Preço'}</Text>
+              {params.precoDetectado !== null && params.precoDetectado !== undefined && (
+                <View style={{ paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, backgroundColor: 'rgba(255,255,255,0.22)' }}>
+                  <Text style={{ fontSize: 10, fontFamily: 'Inter_700Bold', color: isEditing ? colors.accentForeground : '#ffffff' }}>
+                    LIDO NA ETIQUETA · CONFIRA
+                  </Text>
+                </View>
+              )}
+            </View>
             <Text style={[styles.priceValue, isEditing && { color: colors.accentForeground }]}>{formatCentsBuffer(digits)}</Text>
           </LinearGradient>
 
