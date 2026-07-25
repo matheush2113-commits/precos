@@ -2072,36 +2072,60 @@ function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
 
   // A câmera quase sempre entrega o frame "deitado" (largura > altura), no
   // sentido do sensor físico, mesmo com o celular na posição vertical — mas
-  // a pré-visualização na tela é vertical (altura > largura). Se a gente
-  // escalar direto sem considerar isso, as caixinhas saem giradas/fora do
-  // lugar. Detecta a rotação comparando a "forma" dos dois (deitado vs em
-  // pé) e, se forem opostas, gira as coordenadas 90° antes de escalar.
+  // a pré-visualização na tela é vertical (altura > largura). Detecta a
+  // rotação comparando a "forma" dos dois (deitado vs em pé) e, se forem
+  // opostas, gira as coordenadas 90° antes de escalar.
   const frameIsLandscape = frameWidth > frameHeight;
   const previewIsPortrait = previewSize.height > previewSize.width;
   const needsRotation = frameIsLandscape === previewIsPortrait;
   const effectiveFrameWidth = needsRotation ? frameHeight : frameWidth;
   const effectiveFrameHeight = needsRotation ? frameWidth : frameHeight;
-  const scaleX = previewSize.width / effectiveFrameWidth;
-  const scaleY = previewSize.height / effectiveFrameHeight;
+
+  // CÁLCULO PRECISO — parte 2, o detalhe que mais derruba a precisão em
+  // aparelhos como o Xiaomi: a pré-visualização da câmera não ESPICHA a
+  // imagem pra caber na tela, ela CORTA as bordas que sobram (resizeMode
+  // "cover") — é por isso que às vezes um pedacinho do que a câmera "vê" não
+  // aparece na tela. Câmeras de Xiaomi/MIUI são conhecidas por reportar uma
+  // proporção (aspect ratio) de sensor que raramente bate exatamente com a
+  // proporção da tela do aparelho — então usar um fator de escala DIFERENTE
+  // pra cada eixo (largura e altura separados) distorce a posição real da
+  // caixinha. O jeito matematicamente certo é achar UM fator de escala só
+  // (o MAIOR entre os dois eixos, que é o que a Câmera usa pra cobrir a tela
+  // toda) e depois subtrair o quanto ficou pra fora (o "corte") de cada
+  // coordenada.
+  const scale = Math.max(previewSize.width / effectiveFrameWidth, previewSize.height / effectiveFrameHeight);
+  const scaledFrameWidth = effectiveFrameWidth * scale;
+  const scaledFrameHeight = effectiveFrameHeight * scale;
+  const cropOffsetX = (scaledFrameWidth - previewSize.width) / 2;
+  const cropOffsetY = (scaledFrameHeight - previewSize.height) / 2;
 
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
       {boxes.map((box, index) => {
         // Girando 90°, o eixo X do frame vira o eixo Y da tela (e vice
         // versa) — por isso left/top e width/height trocam de par aqui.
-        const left = needsRotation ? box.top : box.left;
-        const top = needsRotation ? box.left : box.top;
-        const width = needsRotation ? box.height : box.width;
-        const height = needsRotation ? box.width : box.height;
+        const rawLeft = needsRotation ? box.top : box.left;
+        const rawTop = needsRotation ? box.left : box.top;
+        const rawWidth = needsRotation ? box.height : box.width;
+        const rawHeight = needsRotation ? box.width : box.height;
+
+        // Escala por UM fator só (não um por eixo) e depois desconta o
+        // corte — essa ordem importa: se descontasse antes de escalar, o
+        // valor descontado estaria na unidade errada.
+        const left = rawLeft * scale - cropOffsetX;
+        const top = rawTop * scale - cropOffsetY;
+        const width = rawWidth * scale;
+        const height = rawHeight * scale;
+
         return (
           <View
             key={index}
             style={{
               position: 'absolute',
-              left: left * scaleX,
-              top: top * scaleY,
-              width: width * scaleX,
-              height: height * scaleY,
+              left,
+              top,
+              width,
+              height,
               borderWidth: 2,
               borderColor: '#06b6d4',
               borderRadius: 4,
@@ -2200,7 +2224,11 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     }
 
     if (lockedRef.current) return;
-    const trimmed = (text ?? '').trim();
+    // O texto que o MLKit devolve (via scanOCR) costuma vir com quebra de
+    // linha (\n) entre cada linha lida na etiqueta — troca tudo por espaço
+    // aqui, na origem, pra NENHUM lugar do app (cartão de sugestão, busca de
+    // preço, casamento com o catálogo) ver texto quebrado em várias linhas.
+    const trimmed = (text ?? '').replace(/\s+/g, ' ').trim();
     if (trimmed.length < OCR_MIN_TEXT_LENGTH) return;
     if (now - lastMatchAtRef.current < LIVE_MATCH_THROTTLE_MS) return;
     lastMatchAtRef.current = now;
@@ -2406,7 +2434,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
             {suggestion.phase === 'notfound' ? (
               <>
                 <Text style={styles.suggestionTitle}>Não encontramos esse produto</Text>
-                <Text style={styles.suggestionSubtitle}>
+                <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
                   {suggestion.recognizedText
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Aponte de novo, bem de perto do nome do produto e com boa luz.'}
@@ -2425,7 +2453,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
             ) : (
               <>
                 <Text style={styles.suggestionTitle}>Produto encontrado pelo texto lido</Text>
-                <Text style={styles.suggestionSubtitle}>
+                <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
                   {suggestion.recognizedText
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
@@ -2562,7 +2590,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     setSuggestion({ phase: 'checking' });
     try {
       const lines = await extractTextFromImage(uri);
-      const recognizedText = (lines || []).join(' ').trim();
+      const recognizedText = (lines || []).join(' ').replace(/\s+/g, ' ').trim();
 
       if (recognizedText.length < OCR_MIN_TEXT_LENGTH) {
         setSuggestion({ phase: 'notfound', recognizedText: '' });
@@ -2626,7 +2654,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
       if (!uri) return;
 
       const lines = await extractTextFromImage(uri);
-      const recognizedText = (lines || []).join(' ').trim();
+      const recognizedText = (lines || []).join(' ').replace(/\s+/g, ' ').trim();
       if (recognizedText.length < OCR_MIN_TEXT_LENGTH) {
         setLiveStatus({ analyzing: false, score: null });
         return;
@@ -2849,7 +2877,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
             ) : suggestion.phase === 'notfound' ? (
               <>
                 <Text style={styles.suggestionTitle}>Não encontramos esse produto</Text>
-                <Text style={styles.suggestionSubtitle}>
+                <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
                   {suggestion.recognizedText
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Tente tirar a foto de novo, bem de perto do nome do produto e com boa luz.'}
@@ -2876,7 +2904,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
             ) : (
               <>
                 <Text style={styles.suggestionTitle}>Produto encontrado pelo texto lido</Text>
-                <Text style={styles.suggestionSubtitle}>
+                <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
                   {suggestion.recognizedText
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
