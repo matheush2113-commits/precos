@@ -2336,39 +2336,54 @@ const MIN_BOX_DIMENSION_PX = 12;
 function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
   if (!boxes || boxes.length === 0 || !frameWidth || !frameHeight || !previewSize.width) return null;
 
-  // A câmera quase sempre entrega o frame "deitado" (largura > altura), no
-  // sentido do sensor físico, mesmo com o celular na posição vertical — mas
-  // a pré-visualização na tela é vertical (altura > largura). Detecta a
-  // rotação comparando a "forma" dos dois (deitado vs em pé) e, se forem
-  // opostas, gira as coordenadas 90° antes de escalar.
+  // ── Por que NÃO rotacionamos as coordenadas aqui ──────────────────────────
+  //
+  // O plugin `vision-camera-ocr-plugin` cria o InputImage do MLKit assim:
+  //
+  //   InputImage.fromMediaImage(mediaImage, frame.getOrientation())
+  //
+  // Quando o celular está em retrato e o sensor é paisagem (o caso normal),
+  // `getOrientation()` devolve 90°. O MLKit recebe esse ângulo e já retorna
+  // as bounding boxes NO ESPAÇO ROTACIONADO (retrato):
+  //   box.left  → 0 … frameHeight  (= largura do retrato)
+  //   box.top   → 0 … frameWidth   (= altura do retrato)
+  //
+  // Portanto as coordenadas das caixas JÁ estão no sistema de coordenadas
+  // da tela — NÃO precisamos girá-las aqui. Se girássemos, estaríamos
+  // aplicando uma segunda rotação por cima da primeira (double-rotation),
+  // que é exatamente o bug que fazia as caixinhas aparecer deslocadas.
+  //
+  // O que SIM precisa ser feito é trocar qual dimensão do frame usar como
+  // "largura" e "altura" no cálculo de escala — porque o frame bruto ainda
+  // é paisagem (frameWidth > frameHeight), mas as coords das caixas usam a
+  // dimensão curta como largura e a longa como altura (o espaço retrato).
+  // ─────────────────────────────────────────────────────────────────────────
+
   const frameIsLandscape = frameWidth > frameHeight;
   const previewIsPortrait = previewSize.height > previewSize.width;
-  const needsRotation = frameIsLandscape === previewIsPortrait;
-  const effectiveFrameWidth = needsRotation ? frameHeight : frameWidth;
-  const effectiveFrameHeight = needsRotation ? frameWidth : frameHeight;
+  // needsDimSwap = true: frame é paisagem mas display é retrato (ou vice-versa)
+  // → as coords das caixas usam frameHeight como largura e frameWidth como altura
+  const needsDimSwap = frameIsLandscape === previewIsPortrait;
 
-  // CÁLCULO PRECISO — parte 2, o detalhe que mais derruba a precisão em
-  // aparelhos como o Xiaomi: a pré-visualização da câmera não ESPICHA a
-  // imagem pra caber na tela, ela CORTA as bordas que sobram (resizeMode
-  // "cover") — é por isso que às vezes um pedacinho do que a câmera "vê" não
-  // aparece na tela. Câmeras de Xiaomi/MIUI são conhecidas por reportar uma
-  // proporção (aspect ratio) de sensor que raramente bate exatamente com a
-  // proporção da tela do aparelho — então usar um fator de escala DIFERENTE
-  // pra cada eixo (largura e altura separados) distorce a posição real da
-  // caixinha. O jeito matematicamente certo é achar UM fator de escala só
-  // (o MAIOR entre os dois eixos, que é o que a Câmera usa pra cobrir a tela
-  // toda) e depois subtrair o quanto ficou pra fora (o "corte") de cada
-  // coordenada.
-  const scale = Math.max(previewSize.width / effectiveFrameWidth, previewSize.height / effectiveFrameHeight);
-  const scaledFrameWidth = effectiveFrameWidth * scale;
-  const scaledFrameHeight = effectiveFrameHeight * scale;
-  const cropOffsetX = (scaledFrameWidth - previewSize.width) / 2;
-  const cropOffsetY = (scaledFrameHeight - previewSize.height) / 2;
+  // Dimensões do espaço de coordenadas que o MLKit usou ao gerar as caixas.
+  // Com needsDimSwap=true: effectiveW = curto do sensor = largura do retrato,
+  //                        effectiveH = longo do sensor  = altura do retrato.
+  const effectiveFrameWidth  = needsDimSwap ? frameHeight : frameWidth;
+  const effectiveFrameHeight = needsDimSwap ? frameWidth  : frameHeight;
 
-  // FILTRO DE RUÍDO + PRIORIDADE: descarta caixa minúscula demais pra ser
-  // texto de verdade, depois ordena da MAIOR pra menor (texto grande costuma
-  // ser o nome/preço — o que interessa —, texto miúdo costuma ser
-  // ingrediente/código de barras/aviso legal) e corta no limite de exibição.
+  // Escala "cover": UM fator só (o maior), depois desconta o corte lateral.
+  // Usar dois fatores separados (um pra X, outro pra Y) distorce a posição
+  // das caixas em aparelhos cujo sensor não tem exatamente a mesma proporção
+  // da tela (Xiaomi, Samsung com câmera de sensor 4:3 em tela 20:9, etc.).
+  const scale            = Math.max(previewSize.width / effectiveFrameWidth, previewSize.height / effectiveFrameHeight);
+  const scaledFrameWidth = effectiveFrameWidth  * scale;
+  const scaledFrameHeight= effectiveFrameHeight * scale;
+  const cropOffsetX      = (scaledFrameWidth  - previewSize.width)  / 2;
+  const cropOffsetY      = (scaledFrameHeight - previewSize.height) / 2;
+
+  // Descarta ruído (caixas minúsculas), ordena da maior pra menor (texto
+  // importante costuma ser grande) e limita em MAX_LIVE_BOXES pra não
+  // poluir a tela.
   const cleanBoxes = boxes
     .filter((box) => Math.min(box.width, box.height) >= MIN_BOX_DIMENSION_PX)
     .sort((a, b) => b.width * b.height - a.width * a.height)
@@ -2377,60 +2392,26 @@ function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
       {cleanBoxes.map((box, index) => {
-        // ROTAÇÃO 90° SENTIDO HORÁRIO — padrão da câmera traseira Android em retrato.
-        //
-        // O sensor fotográfico é fisicamente orientado em paisagem (width > height).
-        // O frame processor do vision-camera recebe o frame BRUTO do sensor, então
-        // as coordenadas das caixas do ML Kit vêm no espaço do frame (paisagem):
-        //   X vai de 0 até frameWidth (eixo horizontal do sensor)
-        //   Y vai de 0 até frameHeight (eixo vertical do sensor)
-        //
-        // A pré-visualização na tela está em retrato (a câmera de preview JÁ gira
-        // a imagem pra mostrar corretamente), então precisamos girar as coordenadas
-        // do frame 90° no sentido horário para que apontem para o lugar certo na tela.
-        //
-        // Fórmula para rotação 90° CW (padrão Android câmera traseira):
-        //   rawLeft  = frameAlturaPaisagem - box.top - box.height
-        //   rawTop   = box.left
-        //   rawWidth = box.height
-        //   rawHeight= box.width
-        //
-        // NOTA: Se num aparelho específico as caixas ficarem espelhadas verticalmente,
-        // é sinal de que esse device usa 90° CCW. Nesse caso, troque por:
-        //   rawLeft  = box.top
-        //   rawTop   = frameAltura - box.left - box.width   (usa effectiveFrameWidth)
-        let rawLeft, rawTop, rawWidth, rawHeight;
-        if (needsRotation) {
-          // 90° CW: eixo Y do sensor (0→frameH) vira eixo X da tela (0→previewW),
-          // mas invertido — canto que ficava embaixo no sensor fica à esquerda na tela.
-          rawLeft  = Math.max(0, effectiveFrameHeight - box.top - box.height);
-          rawTop   = box.left;
-          rawWidth = box.height;
-          rawHeight= box.width;
-        } else {
-          rawLeft  = box.left;
-          rawTop   = box.top;
-          rawWidth = box.width;
-          rawHeight= box.height;
-        }
+        // Converte pixel do espaço MLKit → pixel da tela:
+        //   pixel_tela = pixel_mlkit * scale − cropOffset
+        // (cropOffset desconta a parte da imagem que ficou fora da tela pelo "cover")
+        const left   = box.left   * scale - cropOffsetX;
+        const top    = box.top    * scale - cropOffsetY;
+        const width  = box.width  * scale;
+        const height = box.height * scale;
 
-        // Escala por UM fator só (não um por eixo) e depois desconta o
-        // corte (cover offset) — essa ordem importa: descontar antes de
-        // escalar colocaria o valor na unidade errada.
-        const left   = rawLeft   * scale - cropOffsetX;
-        const top    = rawTop    * scale - cropOffsetY;
-        const width  = rawWidth  * scale;
-        const height = rawHeight * scale;
-
-        // Descarta caixas que caíram completamente fora da área visível
-        // (resultado de rotação incorreta em algum aparelho específico).
+        // Descarta caixas completamente fora da área visível.
         if (left + width < 0 || top + height < 0 ||
             left > previewSize.width || top > previewSize.height) {
           return null;
         }
 
         return (
-          <LiveTextCorners key={index} left={left} top={top} width={width} height={height} showTag={index < MAX_LIVE_TAGS} />
+          <LiveTextCorners
+            key={index}
+            left={left} top={top} width={width} height={height}
+            showTag={index < MAX_LIVE_TAGS}
+          />
         );
       })}
     </View>
