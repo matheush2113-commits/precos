@@ -751,6 +751,21 @@ function extractMl(descriptionUpper) {
   return null;
 }
 
+/**
+ * Igual ao extractMl, mas para PESO (G/KG) — sinal que faltava: produtos
+ * vendidos por peso (arroz, café, carne, farinha...) não tinham nenhum
+ * número "matador" pra confirmar/descartar candidato, só o ML/L, que não
+ * aparece nesse tipo de produto. Sempre devolve o valor em GRAMAS (KG vira
+ * ×1000) pra poder comparar direto com o extraído do outro texto.
+ */
+function extractWeightGrams(descriptionUpper) {
+  const kgMatch = descriptionUpper.match(/(\d+(?:[.,]\d+)?)\s*KG\b/i);
+  if (kgMatch) return Math.round(parseFloat(kgMatch[1].replace(',', '.')) * 1000);
+  const gMatch = descriptionUpper.match(/(\d+(?:[.,]\d+)?)\s*G\b/i);
+  if (gMatch) return Math.round(parseFloat(gMatch[1].replace(',', '.')));
+  return null;
+}
+
 function isMilkDescription(descriptionUpper) {
   return /\bLEITE\b/.test(descriptionUpper);
 }
@@ -833,6 +848,12 @@ function extractPackQuantityFromText(text) {
   if (caixaCom) return parseInt(caixaCom[1], 10);
   const cxAbrev = upper.match(/\bC[XZ]\s*(?:COM)?\s*(\d{1,3})\b/);
   if (cxAbrev) return parseInt(cxAbrev[1], 10);
+  // Fator extra: etiqueta/rótulo que escreve por extenso "12 UNID", "UNIDADES 6"
+  // ou "6UN" sem usar "X" nem "CAIXA" — formato comum em fardo de bebida.
+  const unidComContagem = upper.match(/\b(\d{1,3})\s*UNID(?:ADES?)?\b/);
+  if (unidComContagem) return parseInt(unidComContagem[1], 10);
+  const unidPrefixo = upper.match(/\bUNID(?:ADES?)?\s*(?:COM)?\s*(\d{1,3})\b/);
+  if (unidPrefixo) return parseInt(unidPrefixo[1], 10);
   return null;
 }
 
@@ -1273,6 +1294,37 @@ function similarity(a, b) {
   return 1 - levenshtein(a, b) / maxLen;
 }
 
+/**
+ * FATOR EXTRA DE PRECISÃO — similaridade por bigramas de caracteres (Jaccard).
+ * O Levenshtein (função "similarity" acima) compara a string INTEIRA na
+ * ordem em que veio — então quando a OCR lê as palavras fora de ordem
+ * ("ZERO COCA COLA 200ML" em vez de "COCA COLA ZERO 200ML"), o score de
+ * Levenshtein desaba mesmo sendo o produto certo. Bigramas de caractere não
+ * ligam pra ordem das PALAVRAS (só das letras dentro de cada par), então
+ * pega esse caso que o Levenshtein sozinho perde. Usado como sinal
+ * complementar em productTextSimilarity, nunca sozinho.
+ */
+function charBigramSet(text) {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  const set = new Set();
+  for (let i = 0; i < clean.length - 1; i += 1) {
+    set.add(clean.slice(i, i + 2));
+  }
+  return set;
+}
+
+function bigramJaccardSimilarity(a, b) {
+  const setA = charBigramSet(a);
+  const setB = charBigramSet(b);
+  if (setA.size === 0 || setB.size === 0) return setA.size === setB.size ? 1 : 0;
+  let intersection = 0;
+  for (const gram of setA) {
+    if (setB.has(gram)) intersection += 1;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
 const SUGGESTION_THRESHOLD = 0.6;
 // Correspondência por NOME/imagem é mais "ruidosa" que por código de barras
 // (a OCR erra letra, junta palavra, etc), então o piso de aceitação é um
@@ -1547,15 +1599,28 @@ const FUZZY_TOKEN_MATCH_THRESHOLD = 0.72;
  * `tokenFrequency` (opcional, ver buildTokenDocumentFrequency) pesa cada
  * palavra batida pela raridade dela no catálogo — ver comentário acima.
  */
+// FATOR EXTRA DE PRECISÃO — bônus por POSIÇÃO: no nome cadastrado no
+// catálogo, a primeira palavra costuma ser a MARCA (ex.: "COCA-COLA...",
+// "NESTLÉ...", "SKOL..."), que é justamente a palavra mais decisiva pra
+// diferenciar produtos parecidos. Multiplica o peso-por-raridade (idf) do
+// primeiro token do nome do catálogo, pra bater essa palavra específica
+// valer ainda mais do que já valia só pela raridade.
+const BRAND_POSITION_BOOST = 1.35;
+
 function tokenOverlapScore(a, b, tokenFrequency) {
   const tokensA = a.split(' ').filter((t) => t.length > 1);
   const tokensB = b.split(' ').filter((t) => t.length > 1);
   if (tokensA.length === 0 || tokensB.length === 0) return 0;
 
+  const weightsB = tokensB.map((tokenB, idx) => {
+    const base = tokenWeight(tokenB, tokenFrequency);
+    return idx === 0 ? base * BRAND_POSITION_BOOST : base;
+  });
+
   const usedB = new Array(tokensB.length).fill(false);
   let sharedWeight = 0;
   let totalWeightB = 0;
-  for (const tokenB of tokensB) totalWeightB += tokenWeight(tokenB, tokenFrequency);
+  for (const w of weightsB) totalWeightB += w;
 
   for (const tokenA of tokensA) {
     let bestIdx = -1;
@@ -1570,7 +1635,7 @@ function tokenOverlapScore(a, b, tokenFrequency) {
     }
     if (bestIdx !== -1 && bestSim >= FUZZY_TOKEN_MATCH_THRESHOLD) {
       usedB[bestIdx] = true;
-      sharedWeight += bestSim * tokenWeight(tokensB[bestIdx], tokenFrequency);
+      sharedWeight += bestSim * weightsB[bestIdx];
     }
   }
 
@@ -1600,13 +1665,18 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   if (!upperA || !upperB) return 0;
 
   const stringScore = similarity(upperA, upperB);
+  // FATOR EXTRA: bigrama de caractere — ver comentário em bigramJaccardSimilarity.
+  // Pega parte do que o Levenshtein "puro" perde quando as palavras vêm fora
+  // de ordem na OCR, sem precisar confiar só no overlapScore por token.
+  const bigramScore = bigramJaccardSimilarity(upperA, upperB);
   const overlapScore = tokenOverlapScore(upperA, upperB, tokenFrequency);
   // overlapScore agora é "recall" (quanto do nome do catálogo foi achado
   // dentro do texto lido — ver comentário em tokenOverlapScore) e por isso é
   // muito mais confiável quando o texto lido tem ruído extra em volta (outras
   // palavras na foto, ou até bagunça de tela). O Levenshtein de string
   // inteira (stringScore) ainda sofre nesse cenário — por isso pesa menos.
-  let score = stringScore * 0.3 + overlapScore * 0.7;
+  // O bigramScore entra com peso pequeno, só como "desempate"/reforço.
+  let score = stringScore * 0.22 + bigramScore * 0.08 + overlapScore * 0.7;
 
   // ---- ML: sinal "matador" — bate MUITO forte quando é igual, e quase ----
   // ---- elimina quando é diferente -----------------------------------------
@@ -1623,6 +1693,21 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   const mlB = extractMl(upperB);
   if (mlA !== null && mlB !== null) {
     if (mlA !== mlB) {
+      score *= 0.12;
+    } else {
+      score = score + (1 - score) * 0.4;
+    }
+  }
+
+  // ---- PESO (G/KG): mesmo princípio do ML, pra produto vendido por peso ---
+  // Cobre o caso que o ML não cobre: arroz, café, carne, farinha, açúcar
+  // etc. não têm ML nenhum no rótulo, só peso — sem esse sinal, esses
+  // produtos ficavam sem nenhum número "matador" pra confirmar/descartar
+  // candidato, dependendo só do nome. Mesma lógica de bônus/penalidade do ML.
+  const pesoA = extractWeightGrams(upperA);
+  const pesoB = extractWeightGrams(upperB);
+  if (pesoA !== null && pesoB !== null) {
+    if (pesoA !== pesoB) {
       score *= 0.12;
     } else {
       score = score + (1 - score) * 0.4;
@@ -1973,6 +2058,19 @@ async function findBestMatchBySyllable(recognizedText) {
 /* ------------------------------------------------------------------------ */
 
 async function enrichRecognizedText(recognizedText) {
+  // FATOR EXTRA DE PRECISÃO — código de barras já vem impresso (em dígitos,
+  // por baixo das barras) em boa parte das embalagens, e às vezes a OCR
+  // pega esses dígitos junto com o nome do produto na mesma foto. Quando
+  // isso acontece é o sinal mais forte que existe (13/14/12/8 dígitos batem
+  // com o código de barras EXATO cadastrado, não uma aproximação de nome),
+  // então testa isso ANTES de qualquer casamento por nome — mais confiável
+  // e mais rápido (nem gasta IA/web se já achou por aqui).
+  const gtinNaFoto = extractGtinFromText(recognizedText);
+  if (gtinNaFoto) {
+    const byGtinNaFoto = await findProductByCodigo(gtinNaFoto);
+    if (byGtinNaFoto) return { found: true, score: 1, product: byGtinNaFoto, stage: 'codigo-na-foto' };
+  }
+
   const direct = await findBestMatchByProductText(recognizedText);
   if (direct.found && direct.score >= 0.65) {
     return { ...direct, stage: 'direto' };
@@ -2172,11 +2270,52 @@ const isSmartModeSupported = !!isTextExtractorSupported;
 // precisar de reforço nenhum.
 const STAGE_LABELS = {
   direto: null,
+  'codigo-na-foto': 'Código de barras lido na foto',
   'ia-ocr': 'Corrigido por IA',
   'busca-web': 'Confirmado por busca na web',
   'ean-web': 'Código de barras achado na web',
   silaba: 'Casamento por sílaba',
 };
+
+/**
+ * "VER MAIS" — monta um texto de diagnóstico completo mostrando exatamente
+ * o que a OCR leu na foto e quais sinais o Modo Inteligente extraiu dali
+ * (ML, peso, quantidade de fardo, preço, código de barras), pra pessoa
+ * conseguir conferir se a leitura bateu certo com o rótulo de verdade —
+ * como pedido: poder ver tudo que o sistema está lendo, não só o resultado
+ * final resumido.
+ */
+function describeRecognizedText(recognizedText, extra) {
+  const raw = (recognizedText ?? '').trim();
+  if (!raw) return 'Nenhum texto foi reconhecido nessa leitura.';
+
+  const upper = normalizeProductText(raw);
+  const ml = extractMl(upper);
+  const peso = extractWeightGrams(upper);
+  const quantidade = extractPackQuantityFromText(upper);
+  const precoLido = extractPriceFromText(raw);
+  const gtin = extractGtinFromText(raw);
+
+  const linhas = [`Texto bruto lido pela câmera:\n"${raw}"`];
+
+  const sinais = [];
+  if (gtin) sinais.push(`Código de barras encontrado no texto: ${gtin}`);
+  if (ml !== null) sinais.push(`Volume identificado: ${formatVolume(ml)}`);
+  if (peso !== null) sinais.push(`Peso identificado: ${peso >= 1000 ? `${(peso / 1000).toFixed(peso % 1000 === 0 ? 0 : 3)}kg` : `${peso}g`}`);
+  if (quantidade !== null) sinais.push(`Quantidade de fardo/caixa identificada: ${quantidade} un.`);
+  if (precoLido !== null) sinais.push(`Preço identificado na etiqueta: ${formatBRL(precoLido)}`);
+  if (sinais.length > 0) linhas.push(`Sinais extraídos:\n${sinais.map((s) => `• ${s}`).join('\n')}`);
+  else linhas.push('Nenhum sinal extra (ML, peso, fardo ou preço) foi identificado nesse texto — o casamento usou só o nome.');
+
+  if (extra?.stage && STAGE_LABELS[extra.stage]) {
+    linhas.push(`Como o produto foi confirmado: ${STAGE_LABELS[extra.stage]}`);
+  }
+  if (extra?.score !== null && extra?.score !== undefined) {
+    linhas.push(`Confiança do casamento: ${Math.round(Math.max(0, Math.min(1, extra.score)) * 100)}%`);
+  }
+
+  return linhas.join('\n\n');
+}
 
 /**
  * Barra de progresso da CONFIANÇA da leitura (0 a 100%) — usada tanto no
@@ -2429,6 +2568,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
   const [liveBoxes, setLiveBoxes] = useState({ boxes: [], frameWidth: 0, frameHeight: 0 });
   const [previewSize, setPreviewSize] = useState({ width: 0, height: 0 });
+  const { modal: rawTextModal, show: showRawText } = useAppAlert();
   const lockedRef = useRef(false);
   const lastMatchAtRef = useRef(0);
   const lastBoxUpdateAtRef = useRef(0);
@@ -2728,6 +2868,19 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Aponte de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
+                {!!suggestion.recognizedText && (
+                  <Pressable
+                    onPress={() => showRawText(
+                      'O que a leitura encontrou',
+                      describeRecognizedText(suggestion.recognizedText, suggestion),
+                      [{ text: 'Fechar', style: 'cancel' }],
+                      { icon: 'list', iconColor: colors.primary },
+                    )}
+                    hitSlop={8}
+                  >
+                    <Text style={{ color: colors.primary, fontSize: 12, fontFamily: 'Inter_700Bold', marginTop: -4 }}>Ver mais</Text>
+                  </Pressable>
+                )}
                 <View style={styles.suggestionActions}>
                   <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => setSuggestion(null)}>
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Tentar de novo</Text>
@@ -2747,6 +2900,19 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
                 </Text>
+                {!!suggestion.recognizedText && (
+                  <Pressable
+                    onPress={() => showRawText(
+                      'O que a leitura encontrou',
+                      describeRecognizedText(suggestion.recognizedText, suggestion),
+                      [{ text: 'Fechar', style: 'cancel' }],
+                      { icon: 'list', iconColor: colors.primary },
+                    )}
+                    hitSlop={8}
+                  >
+                    <Text style={{ color: colors.primary, fontSize: 12, fontFamily: 'Inter_700Bold', marginTop: -4 }}>Ver mais</Text>
+                  </Pressable>
+                )}
                 {STAGE_LABELS[suggestion.stage] && (
                   <View style={[styles.suggestionTag, { alignSelf: 'flex-start', backgroundColor: colors.secondary }]}>
                     <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
@@ -2810,6 +2976,8 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
         <ModeButton label="EAN-13" active={scanMode === 'ean13'} onPress={() => handleSelectMode('ean13')} />
         <ModeButton label="Inteligente" active={scanMode === 'smart'} onPress={() => handleSelectMode('smart')} />
       </BlurView>
+
+      {rawTextModal}
     </View>
   );
 }
@@ -2825,6 +2993,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   // ---- Modo Inteligente AO VIVO: estado do "placar" que fica atualizando -
   // enquanto a câmera embutida fica ligada, sem precisar tocar em nada. ----
   const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
+  const { modal: rawTextModal, show: showRawText } = useAppAlert();
   const cameraRef = useRef(null);
   const smartLoopBusyRef = useRef(false);
   const lockedRef = useRef(false);
@@ -3185,6 +3354,19 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Tente tirar a foto de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
+                {!!suggestion.recognizedText && (
+                  <Pressable
+                    onPress={() => showRawText(
+                      'O que a leitura encontrou',
+                      describeRecognizedText(suggestion.recognizedText, suggestion),
+                      [{ text: 'Fechar', style: 'cancel' }],
+                      { icon: 'list', iconColor: colors.primary },
+                    )}
+                    hitSlop={8}
+                  >
+                    <Text style={{ color: colors.primary, fontSize: 12, fontFamily: 'Inter_700Bold', marginTop: -4 }}>Ver mais</Text>
+                  </Pressable>
+                )}
                 {suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined && (
                   <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
                     <Text style={styles.suggestionProductPrice}>{formatBRL(suggestion.precoDetectado)}</Text>
@@ -3212,6 +3394,19 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                     ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
                 </Text>
+                {!!suggestion.recognizedText && (
+                  <Pressable
+                    onPress={() => showRawText(
+                      'O que a leitura encontrou',
+                      describeRecognizedText(suggestion.recognizedText, suggestion),
+                      [{ text: 'Fechar', style: 'cancel' }],
+                      { icon: 'list', iconColor: colors.primary },
+                    )}
+                    hitSlop={8}
+                  >
+                    <Text style={{ color: colors.primary, fontSize: 12, fontFamily: 'Inter_700Bold', marginTop: -4 }}>Ver mais</Text>
+                  </Pressable>
+                )}
                 {STAGE_LABELS[suggestion.stage] && (
                   <View style={[styles.suggestionTag, { alignSelf: 'flex-start', backgroundColor: colors.secondary }]}>
                     <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
@@ -3281,6 +3476,8 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
         <ModeButton label="EAN-13" active={scanMode === 'ean13'} onPress={() => handleSelectMode('ean13')} />
         <ModeButton label="Inteligente" active={scanMode === 'smart'} onPress={() => handleSelectMode('smart')} />
       </BlurView>
+
+      {rawTextModal}
     </View>
   );
 }
