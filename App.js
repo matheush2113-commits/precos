@@ -633,6 +633,19 @@ function isMilkDescription(descriptionUpper) {
 }
 
 /**
+ * Calcula o preço por LITRO a partir do preço da embalagem e do volume em
+ * ml — útil pra comparar produtos de tamanhos diferentes (ex.: qual rende
+ * mais, a garrafa de 200ml ou a de 2L). Devolve null se faltar preço ou ml,
+ * ou se o ml for 0 (evita dividir por zero).
+ */
+function computeUnitPricePerLiter(preco, ml) {
+  if (preco === null || preco === undefined || !ml) return null;
+  const litros = ml / 1000;
+  if (litros <= 0) return null;
+  return preco / litros;
+}
+
+/**
  * Acha a quantidade de fardo/caixa num texto livre (OCR ou nome cadastrado):
  * "12X", "X12", "12 X", "CAIXA COM 12", "CX 12", "C/12". Devolve null se não
  * achar nenhum padrão — nesse caso productTextSimilarity simplesmente ignora
@@ -2048,6 +2061,13 @@ function ConfidenceBar({ score, dark = true }) {
  * de sempre (ScannerScreenLegacy) — sem exigir nada manual da pessoa que usa
  * o app, e sem quebrar nada em quem ainda não fez o build com as libs novas.
  */
+/** Linha "R$ X,XX/L" — só aparece quando dá pra calcular (tem preço e ml). */
+function UnitPriceLine({ preco, ml, style }) {
+  const perLiter = computeUnitPricePerLiter(preco, ml);
+  if (perLiter === null) return null;
+  return <Text style={style}>{formatBRL(perLiter)}/L</Text>;
+}
+
 function ScannerScreen(props) {
   if (isVisionCameraSupported) {
     return <LiveTextScanner {...props} />;
@@ -2581,6 +2601,11 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                       {suggestion.quantidade ? `Caixa com ${suggestion.quantidade}` : ''}
                     </Text>
                   )}
+                  <UnitPriceLine
+                    preco={suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined ? suggestion.precoDetectado : suggestion.preco}
+                    ml={suggestion.ml}
+                    style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 2 }}
+                  />
                 </View>
                 <View style={styles.suggestionActions}>
                   <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}>
@@ -3032,6 +3057,11 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                       {suggestion.quantidade ? `Caixa com ${suggestion.quantidade}` : ''}
                     </Text>
                   )}
+                  <UnitPriceLine
+                    preco={suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined ? suggestion.precoDetectado : suggestion.preco}
+                    ml={suggestion.ml}
+                    style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 2 }}
+                  />
                 </View>
                 <View style={styles.suggestionActions}>
                   <Pressable
@@ -3380,6 +3410,16 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
               )}
             </View>
             <Text style={[styles.priceValue, isEditing && { color: colors.accentForeground }]}>{formatCentsBuffer(digits)}</Text>
+            <UnitPriceLine
+              preco={centsToAmount(digits)}
+              ml={mlInput ? Number(mlInput) : null}
+              style={{
+                color: isEditing ? 'rgba(43,29,0,0.7)' : 'rgba(255,255,255,0.75)',
+                fontSize: 12,
+                fontFamily: 'Inter_600SemiBold',
+                marginTop: 2,
+              }}
+            />
           </LinearGradient>
 
           <NumericKeypad onKeyPress={handleKeyPress} />
