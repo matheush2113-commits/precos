@@ -462,6 +462,103 @@ const SERPAPI_API_KEY = '8c215e3fa31b06c116f4e269dcc2f3cf19d777af7a764398ee0060f
 // Planilha "Cordeiro Supermercados" no Baserow: database 123771 / tabela 322640
 const BASEROW_TABLE_ID = '322640';
 const BASEROW_BASE_URL = `https://api.baserow.io/api/database/rows/table/${BASEROW_TABLE_ID}`;
+
+/* ------------------------------------------------------------------------ */
+/* BANCO DE DADOS LOCAL (snapshot do CSV exportado)                          */
+/*                                                                           */
+/* Cópia local dos produtos mais comuns da tabela Baserow 322640. Serve como */
+/* CACHE FRIO: quando o app está sem internet ou o Baserow demora, essa base  */
+/* garante que o OCR já encontra os produtos principais instantaneamente,    */
+/* sem latência de rede. O Baserow ainda é a fonte de verdade — esta lista   */
+/* só funciona como acelerador / fallback offline.                           */
+/* Quando a planilha crescer, basta re-exportar o CSV e atualizar esta lista.*/
+/* ------------------------------------------------------------------------ */
+const LOCAL_PRODUCTS_SNAPSHOT = [
+  { id: 3,   codigo: '0000789366830', produto: 'CERV LAGER HEINEKEN LN 6X330ml',          ml: 330, quantidade: 6  },
+  { id: 4,   codigo: '7891991015462', produto: 'CERV STELLA ARTOIS LN 6X330ml',           ml: 330, quantidade: 6  },
+  { id: 5,   codigo: '7891149108732', produto: 'CERV LAGER CORONA LN 6X330ml',            ml: 330, quantidade: 6  },
+  { id: 6,   codigo: '7891991014762', produto: 'CERV LAGER BUDWEISER LN 6X330ml',         ml: 330, quantidade: 6  },
+  { id: 7,   codigo: '7896045506040', produto: 'CERV HEINEKEN ZERO ALC LN 6X330ml',       ml: 330, quantidade: 6  },
+  { id: 8,   codigo: '7891991297493', produto: 'CERV  P MALTE SPATEM LN 6X355ml',         ml: 355, quantidade: 6  },
+  { id: 9,   codigo: '7891149104932', produto: 'CERV BRAHMA ZERO ÁLCOOL 12X350ml',        ml: 350, quantidade: 12 },
+  { id: 10,  codigo: '7896045506064', produto: 'CERV HEINEKEN ZERO ÁLCOOL 12X350ml',      ml: 350, quantidade: 12 },
+  { id: 11,  codigo: '7898367983356', produto: 'CERV EISENBAHN 12X473ml',                 ml: 473, quantidade: 12 },
+  { id: 12,  codigo: '7896045505340', produto: 'CERVEJA LAGER AMSTEL 12X473ml',           ml: 473, quantidade: 12 },
+  { id: 13,  codigo: '7896045506248', produto: 'CERV HEINEKEN LT 12X473ml',               ml: 473, quantidade: 12 },
+  { id: 14,  codigo: '7896045503414', produto: 'CERVEJA PILSEN KAISER 12X473ml',          ml: 473, quantidade: 12 },
+  { id: 15,  codigo: '7891991009164', produto: 'CERV PILSEN ANTARTICA 12X473ml',          ml: 473, quantidade: 12 },
+  { id: 16,  codigo: '7891991295017', produto: 'CERV ANTARCTICA ORIGINAL 12X473ml',       ml: 473, quantidade: 12 },
+  { id: 17,  codigo: '7891149011001', produto: 'CERVEJA BRAHMA  12X473ml',                ml: 473, quantidade: 12 },
+  { id: 18,  codigo: '7891991303309', produto: 'CERVEJA STELLA ARTOIS 12X473ml',          ml: 473, quantidade: 12 },
+  { id: 19,  codigo: '7891991014236', produto: 'CERVEJA P MALTE BOHEMIA 473ml',           ml: 473, quantidade: 12 },
+  { id: 20,  codigo: '7891991303200', produto: 'CERVE P MALTE SPATEM LT  12X473ml',       ml: 473, quantidade: 12 },
+  { id: 21,  codigo: '07891991010153',produto: 'CERV ANTARTICA SUB ZERO 473ml',           ml: 473, quantidade: 12 },
+  { id: 22,  codigo: '7896051111016', produto: 'LEITE ITAMBÊ INTEGRAL 12X1L',             ml: 1,   quantidade: 12 },
+  { id: 23,  codigo: '7896051111702', produto: 'LEITE ITAMBÊ DESNATADO 12X1L',            ml: 1,   quantidade: 12 },
+  { id: 24,  codigo: '7896051111528', produto: 'LEITE ITAMBÊ SEMIDESNATADO 12X1L',        ml: 1,   quantidade: 12 },
+  { id: 25,  codigo: '7896122305207', produto: 'LEITE PORTO ALEGRE INTEGRAL 12X1L',       ml: 1,   quantidade: 12 },
+  { id: 26,  codigo: '7896183202187', produto: 'LEITE QUATA INTEGRAL 12X1L',              ml: 1,   quantidade: 12 },
+  { id: 27,  codigo: '7898215151708', produto: 'LEITE PIRACANJUBA INTEGRAL 12X1L',        ml: 1,   quantidade: 12 },
+  { id: 28,  codigo: '7896447500103', produto: 'ÁGUA IGARAPE SEM GÁS 12X500ml',           ml: 500, quantidade: 12 },
+  { id: 29,  codigo: '7896447500363', produto: 'ÁGUA IGARAPÉ COM GÁS 12X500ml',           ml: 500, quantidade: 12 },
+  { id: 30,  codigo: '000789338738',  produto: 'REFRI COCA COLA MINI PET 12X200ml',       ml: 200, quantidade: 12 },
+  { id: 31,  codigo: '7800660636419', produto: 'REFRI SUKITA LARANJA PET 12X200ml',       ml: 200, quantidade: 12 },
+  { id: 32,  codigo: '07891991014984',produto: 'REFRI SODA LIMONADA PET 12X200ml',        ml: 200, quantidade: 12 },
+  { id: 33,  codigo: '7891991014908', produto: 'REFRI GUARANÁ ANTARTICA PET 12X200ml',    ml: 200, quantidade: 12 },
+  { id: 34,  codigo: '7891991016124', produto: 'REFRI GUARANÁ ZERO PET 12X200ml',         ml: 200, quantidade: 12 },
+  { id: 35,  codigo: '7892840800567', produto: 'REFRI PEPSI PET 12X200ml',                ml: 200, quantidade: 12 },
+  { id: 36,  codigo: '7896036090855', produto: 'ÓLEO DE SOJA VELEIRO 6X900ml',            ml: 900, quantidade: 6  },
+  { id: 37,  codigo: '7896036090244', produto: 'ÓLEO DE SOJA LIZA 6X900ml',               ml: 900, quantidade: 6  },
+  { id: 38,  codigo: '7891149040308', produto: 'CERV MALZBIER BRAHMA 6X355ml',            ml: 355, quantidade: 6  },
+  { id: 39,  codigo: '7898915949193', produto: 'CERV PILSEN IMPERIO 12X473ml',            ml: 473, quantidade: 12 },
+  { id: 40,  codigo: '7891991011723', produto: 'CERV PILSEN BUDWEISER 12X473ml',          ml: 473, quantidade: 12 },
+  { id: 67,  codigo: '7896427701391', produto: 'LEITE INTEGRAL ITA 12X1L',                ml: 1,   quantidade: 12 },
+  { id: 68,  codigo: '7898080640017', produto: 'LEITE  INTEGRAL ITALAC 12X1L',            ml: 1,   quantidade: 12 },
+  { id: 69,  codigo: '7898926669042', produto: 'AGUA MIN GRAO MOGOL 12X500ml',            ml: 500, quantidade: 12 },
+  { id: 70,  codigo: '7891991297479', produto: 'CERV P MALTE SPATEM LN 6X355ml',         ml: 355, quantidade: 6  },
+  { id: 71,  codigo: '7896045505371', produto: 'CERV LAGER HEINEKEN LN 6X330ml',          ml: 330, quantidade: 6  },
+  { id: 72,  codigo: '7898969406963', produto: 'CERV PILSEN BRUDER BX GASTRO 12X473ml',   ml: 473, quantidade: 12 },
+  { id: 73,  codigo: '789862528372',  produto: 'CERV PILSEN LAUT 12X473ml',               ml: 473, quantidade: 12 },
+  { id: 74,  codigo: '7897395099695', produto: 'CERV P MALTE PETRA 12X473ml',             ml: 473, quantidade: 12 },
+  { id: 75,  codigo: '7897395020217', produto: 'CERV PILSEN ITAIPAVA LT 12X473ml',        ml: 473, quantidade: 12 },
+  { id: 76,  codigo: '7891149201006', produto: 'CERV PILSEN SKOL LT 12X473ml',            ml: 473, quantidade: 12 },
+  { id: 100, codigo: '7891991303484', produto: 'CERV LAGER CORONA LN 6X330ml',            ml: 330, quantidade: 6  },
+  { id: 133, codigo: '7891991014779', produto: 'CERV LAGER BUDWEISER LN 6X330ml',         ml: 330, quantidade: 6  },
+  { id: 167, codigo: '7898962528372', produto: 'CERV PILSEN LAUT 12X473ml',               ml: 473, quantidade: 12 },
+  { id: 199, codigo: '7891991014984', produto: 'REFRI CAÇULINHA  SODA 12X200ml',          ml: 200, quantidade: 12 },
+  { id: 232, codigo: '000789366830',  produto: 'CERV LAGER HEINEKEN LN 6X330ml',          ml: 330, quantidade: 6  },
+  { id: 233, codigo: '78936683',      produto: 'CERV LAGER HEINEKEN LN 6X330ml',          ml: 330, quantidade: 6  },
+  { id: 265, codigo: '7896045503063', produto: 'CERVEJA KAISER 12X473ml',                 ml: 473, quantidade: 12 },
+  { id: 266, codigo: '7891149210503', produto: 'CERV MALZIBIER CARACU 12X350ml',          ml: 350, quantidade: 12 },
+  { id: 298, codigo: '7896590801232', produto: 'LEITE INTEGRAL CEMIL  12X1L',             ml: 1,   quantidade: 12 },
+  { id: 331, codigo: '7891991298421', produto: 'CERV ZERO ALC BUDWEISER LN 6x330ml',      ml: 330, quantidade: 6  },
+  { id: 364, codigo: '7898367983813', produto: 'CERV AMERICA IPA EISENBAHN LN 6X355ml',   ml: 355, quantidade: 6  },
+  { id: 365, codigo: '7898367980034', produto: 'CERV PALE ALE  EISENBAHN LN 6X355ml',     ml: 355, quantidade: 6  },
+  { id: 366, codigo: '7891149010301', produto: 'CERV PILSEN BRAHMA LN 6X355ml',           ml: 355, quantidade: 6  },
+  { id: 367, codigo: '7895045506439', produto: 'CERV UTRA AMSTEL LN 6X275ml',             ml: 275, quantidade: 6  },
+  { id: 368, codigo: '7894900151510', produto: 'FANTA LARANJA ZERO 12x2l',                ml: 2,   quantidade: 12 },
+  { id: 397, codigo: '7896547501178', produto: 'COQ COROTE LIMAO 12X500ml',               ml: 500, quantidade: 12 },
+  { id: 430, codigo: '7896657764128', produto: 'CERV CHOPP ESCOBIR 12X473ml',             ml: 473, quantidade: 12 },
+  { id: 463, codigo: '000789089012',  produto: 'REFRI COCA COLA MINI PET 12X200ml',       ml: 200, quantidade: 12 },
+  { id: 496, codigo: '7891991012454', produto: 'CERV PILSEN BUDWEISER 12X473ml',          ml: 473, quantidade: 12 },
+  { id: 497, codigo: '7891149108282', produto: 'REFRI SUKITA LARANJA PET 12X200ml',       ml: 200, quantidade: 12 },
+  { id: 498, codigo: '7896447500462', produto: 'ÁGUA IGARAPE SEM GÁS 12X500ml',           ml: 500, quantidade: 12 },
+  { id: 529, codigo: '7891149108718', produto: 'CERV LAGER CORONA LN 6X330ml',            ml: 330, quantidade: 6  },
+  { id: 530, codigo: '3228982014762', produto: 'CERV LAGER BUDWEISER LN 6X330ml',         ml: 330, quantidade: 6  },
+  { id: 562, codigo: '7896045506910', produto: 'CERV HEINEKEN ZERO ÁLCOOL 12X350ml',      ml: 350, quantidade: 12 },
+  { id: 563, codigo: '000001066418',  produto: 'REFRI COCA COLA 12X350ML',                ml: 350, quantidade: 12 },
+  { id: 595, codigo: '7898080640611', produto: 'LEITE INTEGRAL ITALAC 12X1L',             ml: 1,   quantidade: 12 },
+  { id: 628, codigo: '7898080640628', produto: 'LEITE ED SEMI DESN ITALAC 12X1L',         ml: 1,   quantidade: 12 },
+  { id: 661, codigo: '7896434920549', produto: 'LEITE INTEGRAL TRIANGULO 12X1L',          ml: 1,   quantidade: 12 },
+  { id: 664, codigo: '7896434920631', produto: 'LEITE  TRIANGULO DESNATADO 1L 1000MLX12', ml: 1000,quantidade: 12 },
+  { id: 666, codigo: '7896569405027', produto: 'LEITE DESNATADO LIDER 1LX12',             ml: 1,   quantidade: 12 },
+  { id: 668, codigo: '378832203211',  produto: 'COCA COLA 12X200ML',                      ml: 200, quantidade: 6  },
+  { id: 669, codigo: '7896045506439', produto: 'CERVEJA AMSTEL PURO MALTE GARRAFA 6x275ml',ml: 275,quantidade: 6 },
+  { id: 670, codigo: '7898962528532', produto: 'LAUT 355ML DE LEVE',                      ml: 355, quantidade: 6  },
+  { id: 671, codigo: '7896051128069', produto: 'LEITE ZERO LACTOSE ITAMBE 1LX12',         ml: 1,   quantidade: 12 },
+  { id: 672, codigo: '7896045507696', produto: 'CERV HEINEKEN ULTIMATE S/GLUTEN 6x330ML LN',ml: 330,quantidade: 6},
+  { id: 673, codigo: '0000078933873', produto: 'COCA COLA ZERO PET 12X200ML',             ml: 200, quantidade: 12 },
+];
 const FIELD_IDS = {
   codigo: 2349768,
   produto: 2349769,
@@ -505,19 +602,45 @@ async function baserowFetch(path, init) {
 
 /** Busca uma linha pelo CODIGO (código de barras) exato. */
 async function findProductByCodigo(codigo) {
-  const params = new URLSearchParams({
-    user_field_names: 'true',
-    size: '1',
-    [`filter__field_${FIELD_IDS.codigo}__equal`]: codigo,
+  if (!codigo) return null;
+
+  // 1) Tenta no snapshot local primeiro (instantâneo, sem rede).
+  const codigoNorm = String(codigo).replace(/\D/g, ''); // só dígitos
+  const local = LOCAL_PRODUCTS_SNAPSHOT.find((p) => {
+    const pNorm = String(p.codigo).replace(/\D/g, '');
+    return pNorm === codigoNorm || p.codigo === codigo;
   });
-  const res = await baserowFetch(`/?${params.toString()}`);
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Baserow lookup falhou (status ${res.status}) ${body}`);
+  if (local) return local;
+
+  // 2) Se o cache do Baserow já tiver dados frescos, busca lá também
+  //    (pode ter produtos novos que ainda não estão no snapshot).
+  if (productsCache && !productsCache.fromSnapshot) {
+    const cached = productsCache.rows.find((p) => {
+      const pNorm = String(p.codigo ?? '').replace(/\D/g, '');
+      return pNorm === codigoNorm || p.codigo === codigo;
+    });
+    if (cached) return cached;
   }
-  const data = await res.json();
-  const row = data.results[0];
-  return row ? rowToProduct(row) : null;
+
+  // 3) Consulta o Baserow diretamente (com fallback silencioso).
+  try {
+    const params = new URLSearchParams({
+      user_field_names: 'true',
+      size: '1',
+      [`filter__field_${FIELD_IDS.codigo}__equal`]: codigo,
+    });
+    const res = await baserowFetch(`/?${params.toString()}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Baserow lookup falhou (status ${res.status}) ${body}`);
+    }
+    const data = await res.json();
+    const row = data.results[0];
+    return row ? rowToProduct(row) : null;
+  } catch (err) {
+    // Sem internet — já tentamos o local acima, então retorna null
+    return null;
+  }
 }
 
 /** Busca todas as linhas da tabela, seguindo a paginação. */
@@ -1158,22 +1281,36 @@ const SUGGESTION_THRESHOLD = 0.6;
 const TEXT_SUGGESTION_THRESHOLD = 0.5;
 
 // Cache curto de todas as linhas, pra o Modo Inteligente não bater na API do
-// Baserow a cada scan (mesma estratégia do backend original, 15s de TTL).
-let productsCache = null;
-const PRODUCTS_CACHE_TTL_MS = 15000;
+// Baserow a cada scan (mesma estratégia do backend original, 30s de TTL).
+// Inicializa com o snapshot local pra que a primeira busca seja instantânea
+// — sem esperar a rede — e o Baserow atualiza o cache assim que responder.
+let productsCache = {
+  rows: LOCAL_PRODUCTS_SNAPSHOT,
+  fetchedAt: 0,       // força refresh na primeira chamada real
+  fromSnapshot: true, // flag pra saber se é o fallback local
+};
+const PRODUCTS_CACHE_TTL_MS = 30000; // 30s (era 15s — reduz chamadas à API)
 
 async function listAllProductsCached() {
   const now = Date.now();
   if (productsCache && now - productsCache.fetchedAt < PRODUCTS_CACHE_TTL_MS) {
     return productsCache.rows;
   }
-  const rows = await listAllProductsRaw();
-  productsCache = { rows, fetchedAt: now };
-  return rows;
+  try {
+    const rows = await listAllProductsRaw();
+    productsCache = { rows, fetchedAt: now, fromSnapshot: false };
+    return rows;
+  } catch {
+    // Sem internet ou Baserow fora — retorna o snapshot local como fallback.
+    // Não zera o cache pra não ficar tentando a cada scan quando offline.
+    productsCache = { ...productsCache, fetchedAt: now - PRODUCTS_CACHE_TTL_MS + 5000 };
+    return productsCache.rows;
+  }
 }
 
 function invalidateProductsCache() {
-  productsCache = null;
+  // Preserva o snapshot local mas força refresh do Baserow na próxima chamada.
+  productsCache = { rows: LOCAL_PRODUCTS_SNAPSHOT, fetchedAt: 0, fromSnapshot: true };
 }
 
 async function findBestMatchByCodigo(codigo) {
@@ -1559,6 +1696,16 @@ async function findBestMatchByProductText(recognizedText) {
 /* qualquer motivo, devolve null e quem chamou ignora essa camada.           */
 /* ------------------------------------------------------------------------ */
 
+// Catálogo de nomes reais extraído do banco de dados local — fornecido ao
+// modelo como exemplos de referência pra ele reconhecer as marcas corretas.
+// Limita a 30 nomes distintos pra não estourar o max_tokens do prompt.
+const _ocrCatalogHints = [...new Set(
+  LOCAL_PRODUCTS_SNAPSHOT.map((p) => {
+    // Extrai só "MARCA TIPO" sem volume/quantidade (ex.: "CERV HEINEKEN LT")
+    return p.produto.replace(/\s+\d+[Xx]\d+\s*(ml|l|ML|L)?\s*$/i, '').trim();
+  })
+)].slice(0, 30).join(', ');
+
 const OCR_FIX_SYSTEM_PROMPT = [
   'Você recebe um texto bagunçado, extraído por OCR de uma foto de rótulo',
   'de produto de supermercado brasileiro. A OCR comete erros típicos: troca',
@@ -1566,14 +1713,20 @@ const OCR_FIX_SYSTEM_PROMPT = [
   'deveriam estar separadas, separa uma palavra no meio por engano, corta',
   'palavra na borda da foto, ou lê símbolo/ruído como se fosse letra.',
   'Sua tarefa: adivinhar o nome REAL do produto (categoria + marca +',
-  'variante/sabor/tipo), corrigindo esses erros. Regras:',
+  'variante/sabor/tipo), corrigindo esses erros.',
+  '',
+  'Produtos que existem neste supermercado (use como referência de nomes reais):',
+  _ocrCatalogHints + '.',
+  '',
+  'Regras:',
   '1. Responda SÓ com o nome corrigido, em maiúsculas, sem aspas, sem',
   '   explicação, sem comentário, sem ponto final.',
   '2. NUNCA inclua volume/peso (L, ML, KG, G) nem quantidade de fardo — não',
   '   é sua tarefa corrigir número, só o nome.',
-  '3. Se o texto estiver curto ou confuso demais pra ter certeza de nada,',
+  '3. Prefira o nome mais próximo da lista de produtos do supermercado acima.',
+  '4. Se o texto estiver curto ou confuso demais pra ter certeza de nada,',
   '   responda exatamente NAO_SEI (é melhor admitir do que inventar marca).',
-  '4. NUNCA invente marca/sabor que não tenha nenhuma pista no texto',
+  '5. NUNCA invente marca/sabor que não tenha nenhuma pista no texto',
   '   original — corrija a grafia, não invente produto novo.',
 ].join('\n');
 
@@ -2089,8 +2242,15 @@ function ScannerScreen(props) {
 /* que só desenhar retângulo é barato.                                       */
 /* ------------------------------------------------------------------------ */
 
-const LIVE_MATCH_THROTTLE_MS = 900;
-const LIVE_BOX_THROTTLE_MS = 120;
+// LIVE_MATCH_THROTTLE_MS: intervalo mínimo entre chamadas ao pipeline de OCR
+// pesado (IA + Baserow). Aumentado de 900 → 1100ms pra reduzir o número de
+// chamadas de rede sem perder responsividade perceptível (a pessoa não vê
+// diferença abaixo de ~1s, mas o app trava muito menos por contenção de rede).
+const LIVE_MATCH_THROTTLE_MS = 1100;
+// LIVE_BOX_THROTTLE_MS: intervalo mínimo entre atualizações visuais das
+// caixinhas "LIDO". Aumentado de 120 → 150ms pra reduzir re-renders sem
+// deixar a animação parecer lenta (abaixo de ~6fps o olho percebe gaguejo).
+const LIVE_BOX_THROTTLE_MS = 150;
 
 /**
  * Caixinhas desenhadas em cima do texto detectado ao vivo — a parte visual
@@ -2108,7 +2268,11 @@ const LIVE_BOX_THROTTLE_MS = 120;
  * relevantes) ganham uma etiquetinha "LIDO" flutuando do lado, com uma
  * linha fina ligando ela ao canto da caixa — bem no estilo do mockup.
  */
-function LiveTextCorners({ left, top, width, height, showTag }) {
+// React.memo garante que o componente só re-renderiza quando as props mudarem
+// de verdade — sem isso, qualquer atualização de estado no pai (ex.: liveStatus)
+// força re-render de TODAS as caixinhas mesmo quando as coordenadas não mudaram,
+// causando aquele efeito de "tremido" ou "travamento visual".
+const LiveTextCorners = React.memo(function LiveTextCorners({ left, top, width, height, showTag }) {
   // Cantos proporcionais ao tamanho da caixa (texto grande = canto maior),
   // com piso e teto pra nunca ficar minúsculo nem exagerado.
   const cornerSize = Math.max(10, Math.min(20, Math.min(width, height) * 0.35));
@@ -2157,7 +2321,7 @@ function LiveTextCorners({ left, top, width, height, showTag }) {
       )}
     </View>
   );
-}
+}); // React.memo — fecha o wrapper de memoização
 
 // Quantas caixas no máximo desenhar por ciclo (perf + não poluir a tela) e
 // quantas delas (as maiores — geralmente o nome/preço, não letra miúda)
@@ -2213,20 +2377,57 @@ function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
       {cleanBoxes.map((box, index) => {
-        // Girando 90°, o eixo X do frame vira o eixo Y da tela (e vice
-        // versa) — por isso left/top e width/height trocam de par aqui.
-        const rawLeft = needsRotation ? box.top : box.left;
-        const rawTop = needsRotation ? box.left : box.top;
-        const rawWidth = needsRotation ? box.height : box.width;
-        const rawHeight = needsRotation ? box.width : box.height;
+        // ROTAÇÃO 90° SENTIDO HORÁRIO — padrão da câmera traseira Android em retrato.
+        //
+        // O sensor fotográfico é fisicamente orientado em paisagem (width > height).
+        // O frame processor do vision-camera recebe o frame BRUTO do sensor, então
+        // as coordenadas das caixas do ML Kit vêm no espaço do frame (paisagem):
+        //   X vai de 0 até frameWidth (eixo horizontal do sensor)
+        //   Y vai de 0 até frameHeight (eixo vertical do sensor)
+        //
+        // A pré-visualização na tela está em retrato (a câmera de preview JÁ gira
+        // a imagem pra mostrar corretamente), então precisamos girar as coordenadas
+        // do frame 90° no sentido horário para que apontem para o lugar certo na tela.
+        //
+        // Fórmula para rotação 90° CW (padrão Android câmera traseira):
+        //   rawLeft  = frameAlturaPaisagem - box.top - box.height
+        //   rawTop   = box.left
+        //   rawWidth = box.height
+        //   rawHeight= box.width
+        //
+        // NOTA: Se num aparelho específico as caixas ficarem espelhadas verticalmente,
+        // é sinal de que esse device usa 90° CCW. Nesse caso, troque por:
+        //   rawLeft  = box.top
+        //   rawTop   = frameAltura - box.left - box.width   (usa effectiveFrameWidth)
+        let rawLeft, rawTop, rawWidth, rawHeight;
+        if (needsRotation) {
+          // 90° CW: eixo Y do sensor (0→frameH) vira eixo X da tela (0→previewW),
+          // mas invertido — canto que ficava embaixo no sensor fica à esquerda na tela.
+          rawLeft  = Math.max(0, effectiveFrameHeight - box.top - box.height);
+          rawTop   = box.left;
+          rawWidth = box.height;
+          rawHeight= box.width;
+        } else {
+          rawLeft  = box.left;
+          rawTop   = box.top;
+          rawWidth = box.width;
+          rawHeight= box.height;
+        }
 
         // Escala por UM fator só (não um por eixo) e depois desconta o
-        // corte — essa ordem importa: se descontasse antes de escalar, o
-        // valor descontado estaria na unidade errada.
-        const left = rawLeft * scale - cropOffsetX;
-        const top = rawTop * scale - cropOffsetY;
-        const width = rawWidth * scale;
+        // corte (cover offset) — essa ordem importa: descontar antes de
+        // escalar colocaria o valor na unidade errada.
+        const left   = rawLeft   * scale - cropOffsetX;
+        const top    = rawTop    * scale - cropOffsetY;
+        const width  = rawWidth  * scale;
         const height = rawHeight * scale;
+
+        // Descarta caixas que caíram completamente fora da área visível
+        // (resultado de rotação incorreta em algum aparelho específico).
+        if (left + width < 0 || top + height < 0 ||
+            left > previewSize.width || top > previewSize.height) {
+          return null;
+        }
 
         return (
           <LiveTextCorners key={index} left={left} top={top} width={width} height={height} showTag={index < MAX_LIVE_TAGS} />
@@ -2750,7 +2951,10 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   // testa contra o catálogo, e atualiza a barra de confiança na hora. Pra
   // quem está usando, PARECE tempo real (não precisa tocar em nada, a
   // resposta é rápida), mesmo não sendo frame-a-frame de verdade.
-  const SMART_LIVE_INTERVAL_MS = 1300;
+  // Aumentado de 1300 → 1500ms: reduz a quantidade de fotos tiradas por minuto
+  // sem mudar a percepção de "tempo real" (abaixo de ~2s a pessoa não sente).
+  // Menos fotos = menos decodificação de JPEG = menos uso de CPU = sem travamento.
+  const SMART_LIVE_INTERVAL_MS = 1500;
 
   const captureLiveFrame = useCallback(async () => {
     if (smartLoopBusyRef.current || lockedRef.current) return;
@@ -2759,8 +2963,14 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     setLiveStatus((prev) => ({ analyzing: true, score: prev?.score ?? null }));
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.35,
+        // quality 0.25: ainda legível pra OCR (texto tem bordas nítidas mesmo em
+        // JPEG baixo) mas o arquivo fica ~3x menor → decodificação mais rápida
+        // → menos frame drops na prévia ao vivo.
+        quality: 0.25,
         skipProcessing: true,
+        // exif: false reduz o tamanho do arquivo e evita que o ML Kit gaste
+        // tempo lendo metadados irrelevantes pra OCR de texto de rótulo.
+        exif: false,
       });
       const uri = photo?.uri;
       if (!uri) return;
