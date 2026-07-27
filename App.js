@@ -649,24 +649,38 @@ function isMilkDescription(descriptionUpper) {
 function extractPriceFromText(text) {
   const upper = (text ?? '').toString().toUpperCase();
 
+  // Aceita "," OU "." como separador decimal — a OCR às vezes lê a vírgula
+  // impressa na etiqueta como se fosse ponto (ex.: lê "3.98" quando na
+  // etiqueta está escrito "3,98"). O formato brasileiro sempre usa vírgula
+  // de verdade, mas aqui a gente aceita os dois pra não perder o preço só
+  // por causa desse erro de leitura.
+
   // Prioridade 1: "R$" bem coladinho no número — é o caso mais confiável,
   // porque é literalmente assim que preço aparece impresso na etiqueta.
-  const withSymbol = upper.match(/R\$\s*(\d{1,4}(?:\.\d{3})*,\d{2})\b/);
+  const withSymbol = upper.match(/R\$\s*(\d{1,4}(?:[.,]\d{3})*[.,]\d{2})\b/);
   if (withSymbol) return parseBRLNumber(withSymbol[1]);
 
-  // Prioridade 2 (mais arriscada): número solto no formato X,XX sem o "R$"
-  // do lado — só usa se for o ÚNICO candidato nesse formato no texto todo,
-  // pra não arriscar pegar o número errado quando há mais de um.
-  const bareMatches = upper.match(/\b\d{1,4}(?:\.\d{3})*,\d{2}\b/g);
+  // Prioridade 2 (mais arriscada): número solto no formato X,XX ou X.XX sem
+  // o "R$" do lado — só usa se for o ÚNICO candidato nesse formato no texto
+  // todo, pra não arriscar pegar o número errado quando há mais de um.
+  const bareMatches = upper.match(/\b\d{1,4}(?:[.,]\d{3})*[.,]\d{2}\b/g);
   if (bareMatches && bareMatches.length === 1) return parseBRLNumber(bareMatches[0]);
 
   return null;
 }
 
-/** Converte "1.234,56" ou "5,87" (formato brasileiro) pro número 1234.56 / 5.87. */
+/**
+ * Converte "1.234,56", "5,87" ou "5.87" (a OCR pode confundir "," com ".")
+ * pro número 1234.56 / 5.87. Regra: os ÚLTIMOS 2 dígitos são sempre os
+ * centavos — não importa se vieram separados por vírgula ou ponto. Qualquer
+ * separador ANTES disso é tratado como separador de milhar e descartado.
+ */
 function parseBRLNumber(value) {
-  const normalized = value.replace(/\./g, '').replace(',', '.');
-  const parsed = Number(normalized);
+  const cleaned = value.trim();
+  const decimalMatch = cleaned.match(/[.,](\d{2})$/);
+  if (!decimalMatch) return null;
+  const integerPart = cleaned.slice(0, cleaned.length - 3).replace(/[.,]/g, '');
+  const parsed = Number(`${integerPart || '0'}.${decimalMatch[1]}`);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
@@ -2067,6 +2081,74 @@ const LIVE_BOX_THROTTLE_MS = 120;
  * as caixinhas aparecerem meio deslocadas num celular específico, é aqui
  * (scaleX/scaleY) que se ajusta.
  */
+/**
+ * Um "canto de mira" (estilo scanner de AR/Google Lens) em volta de um
+ * trecho de texto detectado — 4 cantos em L, sem preencher o meio, pra não
+ * tampar o texto real que a câmera está mostrando. As maiores (mais
+ * relevantes) ganham uma etiquetinha "LIDO" flutuando do lado, com uma
+ * linha fina ligando ela ao canto da caixa — bem no estilo do mockup.
+ */
+function LiveTextCorners({ left, top, width, height, showTag }) {
+  // Cantos proporcionais ao tamanho da caixa (texto grande = canto maior),
+  // com piso e teto pra nunca ficar minúsculo nem exagerado.
+  const cornerSize = Math.max(10, Math.min(20, Math.min(width, height) * 0.35));
+  const strokeWidth = 2.5;
+  const strokeColor = '#22d3ee';
+
+  return (
+    <View style={{ position: 'absolute', left, top, width, height }}>
+      <View
+        style={{
+          position: 'absolute', top: 0, left: 0, width: cornerSize, height: cornerSize,
+          borderLeftWidth: strokeWidth, borderTopWidth: strokeWidth, borderColor: strokeColor, borderTopLeftRadius: 5,
+        }}
+      />
+      <View
+        style={{
+          position: 'absolute', top: 0, right: 0, width: cornerSize, height: cornerSize,
+          borderRightWidth: strokeWidth, borderTopWidth: strokeWidth, borderColor: strokeColor, borderTopRightRadius: 5,
+        }}
+      />
+      <View
+        style={{
+          position: 'absolute', bottom: 0, left: 0, width: cornerSize, height: cornerSize,
+          borderLeftWidth: strokeWidth, borderBottomWidth: strokeWidth, borderColor: strokeColor, borderBottomLeftRadius: 5,
+        }}
+      />
+      <View
+        style={{
+          position: 'absolute', bottom: 0, right: 0, width: cornerSize, height: cornerSize,
+          borderRightWidth: strokeWidth, borderBottomWidth: strokeWidth, borderColor: strokeColor, borderBottomRightRadius: 5,
+        }}
+      />
+      {showTag && (
+        <View style={{ position: 'absolute', top: -8, left: width + 10, flexDirection: 'row', alignItems: 'center' }}>
+          <View style={{ width: 16, height: 1.5, backgroundColor: strokeColor, opacity: 0.85, marginRight: 5 }} />
+          <LinearGradient
+            colors={['#7c3aed', '#06b6d4']}
+            start={{ x: 0, y: 0 }}
+            end={{ x: 1, y: 0 }}
+            style={{ paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999, flexDirection: 'row', alignItems: 'center', gap: 3 }}
+          >
+            <View style={{ width: 5, height: 5, borderRadius: 999, backgroundColor: '#ffffff' }} />
+            <Text style={{ fontSize: 9, fontFamily: 'Inter_700Bold', color: '#ffffff', letterSpacing: 0.4 }}>LIDO</Text>
+          </LinearGradient>
+        </View>
+      )}
+    </View>
+  );
+}
+
+// Quantas caixas no máximo desenhar por ciclo (perf + não poluir a tela) e
+// quantas delas (as maiores — geralmente o nome/preço, não letra miúda)
+// ganham a etiqueta "LIDO" flutuante.
+const MAX_LIVE_BOXES = 10;
+const MAX_LIVE_TAGS = 3;
+// Caixa cujo lado mais curto for menor que isso (em px do FRAME, não da
+// tela) é tratada como ruído — reflexo, poeira, risquinho — e descartada
+// antes até de entrar no cálculo de escala.
+const MIN_BOX_DIMENSION_PX = 12;
+
 function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
   if (!boxes || boxes.length === 0 || !frameWidth || !frameHeight || !previewSize.width) return null;
 
@@ -2099,9 +2181,18 @@ function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
   const cropOffsetX = (scaledFrameWidth - previewSize.width) / 2;
   const cropOffsetY = (scaledFrameHeight - previewSize.height) / 2;
 
+  // FILTRO DE RUÍDO + PRIORIDADE: descarta caixa minúscula demais pra ser
+  // texto de verdade, depois ordena da MAIOR pra menor (texto grande costuma
+  // ser o nome/preço — o que interessa —, texto miúdo costuma ser
+  // ingrediente/código de barras/aviso legal) e corta no limite de exibição.
+  const cleanBoxes = boxes
+    .filter((box) => Math.min(box.width, box.height) >= MIN_BOX_DIMENSION_PX)
+    .sort((a, b) => b.width * b.height - a.width * a.height)
+    .slice(0, MAX_LIVE_BOXES);
+
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      {boxes.map((box, index) => {
+      {cleanBoxes.map((box, index) => {
         // Girando 90°, o eixo X do frame vira o eixo Y da tela (e vice
         // versa) — por isso left/top e width/height trocam de par aqui.
         const rawLeft = needsRotation ? box.top : box.left;
@@ -2118,20 +2209,7 @@ function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
         const height = rawHeight * scale;
 
         return (
-          <View
-            key={index}
-            style={{
-              position: 'absolute',
-              left,
-              top,
-              width,
-              height,
-              borderWidth: 2,
-              borderColor: '#06b6d4',
-              borderRadius: 4,
-              backgroundColor: 'rgba(6,182,212,0.12)',
-            }}
-          />
+          <LiveTextCorners key={index} left={left} top={top} width={width} height={height} showTag={index < MAX_LIVE_TAGS} />
         );
       })}
     </View>
@@ -2363,9 +2441,18 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
         <ScanFrame locked={locked} mode="smart" />
 
         <View style={[styles.hintPill, { flexDirection: 'column', alignItems: 'stretch', width: 240, gap: 6 }]}>
-          <Text style={[styles.hint, { textAlign: 'center' }]}>
-            {liveStatus?.analyzing ? 'Analisando…' : 'Aponte para o rótulo do produto'}
-          </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+            {liveBoxes.boxes.length > 0 && (
+              <View style={{ width: 7, height: 7, borderRadius: 999, backgroundColor: colors.success }} />
+            )}
+            <Text style={[styles.hint, { textAlign: 'center' }]}>
+              {liveStatus?.analyzing
+                ? 'Analisando…'
+                : liveBoxes.boxes.length > 0
+                ? `${liveBoxes.boxes.length} ${liveBoxes.boxes.length === 1 ? 'texto detectado' : 'textos detectados'}`
+                : 'Aponte para o rótulo do produto'}
+            </Text>
+          </View>
           <ConfidenceBar score={liveStatus?.score} />
         </View>
 
