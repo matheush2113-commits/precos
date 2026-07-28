@@ -1,8 +1,8 @@
 {
   "expo": {
     "name": "PRECO",
-    "slug": "gestao-estoque",
-    "version": "5.0.1",
+    "slug": "preco",
+    "version": "5.0.2",
     "orientation": "portrait",
     "icon": "./assets/watermarked_img_9624452897969912344.jpg",
     "userInterfaceStyle": "light",
@@ -76,7 +76,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "0a3a24b2-d850-425b-95ef-b2ec0cd317de"
+        "projectId": "3794ad4e-d515-4ffd-a201-3a508cbe664e"
       }
     }
   }
