@@ -1345,6 +1345,16 @@ function isLikelyNoiseText(rawText) {
   return gibberishCount / judgeable.length >= GIBBERISH_TEXT_REJECT_RATIO;
 }
 
+// FATOR EXTRA DE RECONHECIMENTO — Damerau-Levenshtein (variante "optimal
+// string alignment"), não o Levenshtein comum. A diferença: no Levenshtein
+// comum, duas letras ADJACENTES trocadas de lugar (ex.: "BRAHAM" em vez de
+// "BRAHMA" — o M e o A do fim trocaram de posição) contam como 2 erros
+// (2 substituições), então a semelhança despenca e o casamento pode falhar
+// mesmo sendo um erro de digitação/OCR muito comum e "de 1 letra só" na
+// prática. Aqui, transposição de letra adjacente conta como 1 erro — igual
+// já contava substituir/inserir/remover 1 letra — deixando o casamento
+// mais preciso pra esse tipo de erro específico, sem precisar de internet
+// nem IA pra compensar.
 function levenshtein(a, b) {
   const s = a.toLowerCase();
   const t = b.toLowerCase();
@@ -1352,17 +1362,27 @@ function levenshtein(a, b) {
   const n = t.length;
   if (m === 0) return n;
   if (n === 0) return m;
-  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  // Matriz cheia (não só 2 linhas) porque a transposição olha 2 linhas pra
+  // trás — strings de produto são curtas (poucas dezenas de caracteres),
+  // então o custo extra de memória é irrelevante.
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
   for (let i = 1; i <= m; i++) {
-    const curr = new Array(n + 1);
-    curr[0] = i;
     for (let j = 1; j <= n; j++) {
       const cost = s[i - 1] === t[j - 1] ? 0 : 1;
-      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      let best = Math.min(
+        dp[i - 1][j] + 1, // remoção
+        dp[i][j - 1] + 1, // inserção
+        dp[i - 1][j - 1] + cost, // substituição (ou igual, custo 0)
+      );
+      if (i > 1 && j > 1 && s[i - 1] === t[j - 2] && s[i - 2] === t[j - 1]) {
+        best = Math.min(best, dp[i - 2][j - 2] + 1); // transposição adjacente
+      }
+      dp[i][j] = best;
     }
-    prev = curr;
   }
-  return prev[n];
+  return dp[m][n];
 }
 
 function similarity(a, b) {
@@ -1394,6 +1414,40 @@ function bigramJaccardSimilarity(a, b) {
   const setA = charBigramSet(a);
   const setB = charBigramSet(b);
   if (setA.size === 0 || setB.size === 0) return setA.size === setB.size ? 1 : 0;
+  let intersection = 0;
+  for (const gram of setA) {
+    if (setB.has(gram)) intersection += 1;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+/*
+ * FATOR EXTRA DE DETALHAMENTO — trigrama de caractere (janela de 3 letras).
+ * O bigrama (2 letras) já ajuda a resistir a palavra fora de ordem, mas é
+ * "grosso" — pega semelhança mesmo entre palavras bem diferentes que só
+ * compartilham pares soltos de letra comum (ex.: "AR", "RA"). O trigrama
+ * (3 letras) é mais específico: exige um pedaço maior de texto igual pra
+ * contar como semelhante, então serve de DESEMPATE mais preciso quando o
+ * bigrama e o overlap por palavra ficam próximos entre dois candidatos —
+ * útil justamente quando não dá pra confirmar com IA/web (SerpApi fora do
+ * ar ou cota esgotada) e o app precisa decidir sozinho, só com o que já
+ * tem localmente.
+ */
+function charTrigramSet(text) {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  const set = new Set();
+  if (clean.length < 3) return set;
+  for (let i = 0; i < clean.length - 2; i += 1) {
+    set.add(clean.slice(i, i + 3));
+  }
+  return set;
+}
+
+function trigramJaccardSimilarity(a, b) {
+  const setA = charTrigramSet(a);
+  const setB = charTrigramSet(b);
+  if (setA.size === 0 || setB.size === 0) return 0; // texto curto demais pra ter trigrama: não opina
   let intersection = 0;
   for (const gram of setA) {
     if (setB.has(gram)) intersection += 1;
@@ -1611,6 +1665,93 @@ function fixOcrNumberLookalikes(normalizedText) {
   return text;
 }
 
+/* ---- CORRETOR SEVERO: palavra parecida que a OCR grafou errado ---------- */
+//
+// Problema relatado: a OCR às vezes lê "ZERO" como "ZELO" (R↔L, letras com
+// formato parecido), "ZLERO" (letra a mais no meio) ou "ZTERO" (T
+// intrometido) — troca/inserção de 1 letra dentro da própria palavra. Isso
+// já vinha quebrando o casamento de "variante" (extractVariantSet, mais
+// abaixo): ele só reconhecia "ZERO" com grafia EXATA, então uma foto com
+// "ZELO" era tratada como se não tivesse variante nenhuma, e o produto Zero
+// podia ser confundido com o produto normal (ou penalizado por engano).
+//
+// Em vez de cadastrar cada erro possível um por um (ZELO, ZLERO, ZTERO,
+// ZERQ, ZEBO, ZER0, ...— a lista nunca acaba), este corretor testa CADA
+// PALAVRA do texto lido contra a lista de "palavras-alvo" (as mesmas
+// VARIANT_KEYWORDS de 1 palavra só, mais algumas outras bem comuns em
+// rótulo) usando Levenshtein (a função "similarity" mais abaixo no
+// arquivo). Se a palavra lida está muito parecida (>= WORD_LOOKALIKE_
+// THRESHOLD) de uma palavra-alvo, ela é TROCADA pela grafia certa. Isso
+// resolve automaticamente qualquer variação de 1 letra errada/a mais/a
+// menos, sem precisar prever o erro específico.
+//
+// Por que é "severo" e ainda assim seguro:
+//  • só entra em ação se a palavra lida NÃO é já uma das palavras-alvo
+//    (evita processamento à toa em texto que já veio certo);
+//  • só compara com alvo de tamanho parecido (diferença de até 2
+//    caracteres) — não deixa uma palavra pequena virar uma bem maior;
+//  • ignora palavra com menos de 3 letras (palavra curta demais teria
+//    "sim" alto com qualquer coisa, gerando falso positivo);
+//  • o piso de aceitação (0,74) é ligeiramente mais alto que o piso geral
+//    de fuzzy do app (0,72 — ver FUZZY_TOKEN_MATCH_THRESHOLD mais abaixo),
+//    ou seja, só troca quando a semelhança é MUITO forte (tipicamente 1
+//    letra trocada/a mais/a menos numa palavra curta) — reduz o risco de
+//    "corrigir" uma palavra que só por coincidência ficou parecida.
+const WORD_LOOKALIKE_THRESHOLD = 0.74;
+
+// Nota de ordem: esta constante é lida dentro de fixWordLookalikes, que só
+// RODA em tempo de execução (nunca no carregamento do arquivo) — então não
+// tem problema estar sendo declarada aqui em cima e usada abaixo antes de
+// VARIANT_KEYWORDS existir "por escrito" mais adiante no arquivo; quando a
+// função de fato roda, VARIANT_KEYWORDS já foi montada. Mesmo assim, para
+// deixar claro e evitar qualquer confusão de leitura, a lista de alvos é
+// resolvida dentro da própria função (lazy), não aqui fora.
+function wordLookalikeTargets() {
+  const singleWordVariants = VARIANT_KEYWORDS.filter((k) => !k.includes(' '));
+  // Além das palavras-variante (ZERO, DIET, LIGHT...), estas outras também
+  // aparecem MUITO em rótulo de supermercado e a OCR erra elas com
+  // frequência parecida — vale corrigir do mesmo jeito.
+  const extras = ['REFRIGERANTE', 'CERVEJA', 'GARRAFA', 'LATA', 'FARDO', 'CAIXA'];
+  // FATOR EXTRA DE RECONHECIMENTO — marca também entra na correção de
+  // palavra parecida. A marca é o sinal MAIS decisivo de todo o casamento
+  // (ver BRAND_POSITION_BOOST e o peso por raridade/idf, mais abaixo): é o
+  // que diferencia "COCA-COLA ZERO" de "GUARANÁ ZERO" quando o resto do
+  // texto (ZERO, PET, REFRI...) é genérico. Se a OCR erra 1 letra bem no
+  // nome da marca (ex.: "HEIMEKEN" em vez de "HEINEKEN", "BRAHAM" em vez de
+  // "BRAHMA"), sem essa correção o app perdia justamente o sinal mais forte
+  // que tinha — e ficava mais dependente de IA/busca web pra compensar.
+  // Corrigindo aqui, o casamento direto (que não usa internet nenhuma)
+  // resolve sozinho a maioria desses casos.
+  const brandWords = [
+    ...BRANDS.LEITE, ...BRANDS.CERVEJA, ...BRANDS.REFRIGERANTE, ...BRANDS.AGUA,
+  ]
+    .flatMap((brand) => brand.replace(/-/g, ' ').split(' '))
+    .filter((word) => word.length >= 3);
+  return [...new Set([...singleWordVariants, ...extras, ...brandWords])];
+}
+
+function fixWordLookalikes(normalizedUpperText) {
+  const targets = wordLookalikeTargets();
+  const words = normalizedUpperText.split(' ');
+  const fixedWords = words.map((word) => {
+    if (word.length < 3) return word;
+    if (targets.includes(word)) return word; // já está com a grafia certa
+
+    let bestTarget = null;
+    let bestSim = 0;
+    for (const target of targets) {
+      if (Math.abs(word.length - target.length) > 2) continue; // tamanho muito diferente: ignora
+      const sim = similarity(word, target);
+      if (sim > bestSim) {
+        bestSim = sim;
+        bestTarget = target;
+      }
+    }
+    return bestTarget && bestSim >= WORD_LOOKALIKE_THRESHOLD ? bestTarget : word;
+  });
+  return fixedWords.join(' ');
+}
+
 function normalizeProductText(text) {
   const base = (text ?? '')
     .toString()
@@ -1625,7 +1766,12 @@ function normalizeProductText(text) {
   // unidade/fardo (ver comentário acima). Em texto já limpo (nome cadastrado
   // no Baserow) isso não faz diferença nenhuma; quem se beneficia é o texto
   // vindo da OCR da foto.
-  const fixed = fixOcrNumberLookalikes(base);
+  const numberFixed = fixOcrNumberLookalikes(base);
+
+  // Corretor severo de PALAVRA (ZERO, DIET, LIGHT, GARRAFA...) — pega letra
+  // trocada/a mais/a menos dentro da própria palavra (ZELO, ZLERO, ZTERO
+  // viram ZERO). Ver comentário grande acima de fixWordLookalikes.
+  const fixed = fixWordLookalikes(numberFixed);
 
   // Uniformiza "200 ML" (com espaço) e "200ML" (grudado) pro MESMO formato
   // usado no catálogo (sempre grudado — ver appendPackSuffix). Sem isso, um
@@ -1779,14 +1925,19 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   // Pega parte do que o Levenshtein "puro" perde quando as palavras vêm fora
   // de ordem na OCR, sem precisar confiar só no overlapScore por token.
   const bigramScore = bigramJaccardSimilarity(cleanedA, upperB);
+  // FATOR EXTRA: trigrama de caractere — ver comentário em
+  // trigramJaccardSimilarity. Mais rígido que o bigrama, serve de desempate
+  // fino entre candidatos próximos sem depender de IA/web nenhuma.
+  const trigramScore = trigramJaccardSimilarity(cleanedA, upperB);
   const overlapScore = tokenOverlapScore(cleanedA, upperB, tokenFrequency);
   // overlapScore agora é "recall" (quanto do nome do catálogo foi achado
   // dentro do texto lido — ver comentário em tokenOverlapScore) e por isso é
   // muito mais confiável quando o texto lido tem ruído extra em volta (outras
   // palavras na foto, ou até bagunça de tela). O Levenshtein de string
   // inteira (stringScore) ainda sofre nesse cenário — por isso pesa menos.
-  // O bigramScore entra com peso pequeno, só como "desempate"/reforço.
-  let score = stringScore * 0.22 + bigramScore * 0.08 + overlapScore * 0.7;
+  // bigramScore e trigramScore entram com peso pequeno cada, só como
+  // "desempate"/reforço extra de detalhamento entre candidatos próximos.
+  let score = stringScore * 0.19 + bigramScore * 0.05 + trigramScore * 0.06 + overlapScore * 0.7;
 
   // ---- ML: sinal "matador" — bate MUITO forte quando é igual, e quase ----
   // ---- elimina quando é diferente -----------------------------------------
@@ -2181,6 +2332,213 @@ async function findBestMatchBySyllable(recognizedText) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — ÚLTIMA ALTERNATIVA: "produto com mais letras iguais"   */
+/*                                                                            */
+/* Pedido específico: quando NADA do resto deu certo (nome não bateu por     */
+/* palavra nem por sílaba, IA e busca web também não resolveram), em vez de  */
+/* simplesmente devolver "não achei", varre o catálogo inteiro procurando o  */
+/* produto cujo nome tem mais LETRAS EM COMUM com o texto que a OCR leu —    */
+/* sem olhar ordem, sem separar em palavra nem sílaba, só "quantas letras     */
+/* iguais os dois têm". É o método mais simples e mais "bruto" que existe,   */
+/* mas é justamente o que ainda funciona quando a foto saiu tão ruim que a   */
+/* OCR embaralhou tudo (juntou palavra, inverteu pedaço, faltou letra no meio */
+/* etc.) — os métodos anteriores (que dependem de palavra/sílaba reconhecível) */
+/* desistem nesse caso, mas ainda sobra letra suficiente em comum pra           */
+/* "adivinhar" o produto mais parecido.                                      */
+/*                                                                            */
+/* Como funciona (Sørensen-Dice sobre o "saco de letras" — bag of chars —    */
+/* combinado com bigrama e trigrama, ver rawLetterSimilarity mais abaixo):   */
+/*   1. Tira espaço de tudo (junta a palavra inteira numa sequência só de     */
+/*      letras/números).                                                    */
+/*   2. Conta quantas vezes cada letra aparece nos dois textos (bag of       */
+/*      chars) — mas SOZINHO isso é traiçoeiro (todo produto tem A, O, E,    */
+/*      R, T, C, L de sobra em português), então soma com bigrama/trigrama   */
+/*      (letras em comum GRUDADAS na mesma ordem, não soltas) pra cortar o   */
+/*      falso positivo sem perder a tolerância a texto embaralhado.          */
+/*   3. Score final: 1.0 quando os textos são praticamente iguais, perto de  */
+/*      0 quando não têm nada a ver.                                        */
+/* Continua aplicando a penalidade de ML (200ML vs 350ML são produtos         */
+/* DIFERENTES mesmo com nome parecidíssimo) — é barata e é o sinal mais       */
+/* confiável que existe, então não abre mão dela nem no último recurso.      */
+/*                                                                            */
+/* Por ser o método mais fraco de todos, o piso de aceitação é baixo         */
+/* (RAW_LETTERS_THRESHOLD) — mas o resultado SEMPRE aparece marcado na tela   */
+/* como "correspondência aproximada" (ver STAGE_LABELS, stage                */
+/* 'letras-parecidas') e ainda passa pelo FILTRO DE QUALIDADE normal          */
+/* (hasRequiredScanFields — precisa ter ML + preço + marca reconhecível pra   */
+/* travar sozinho); sem isso o app arriscaria "travar" num produto errado só  */
+/* por coincidência de letra. Na dúvida, a pessoa confere e corrige na hora.  */
+/* ------------------------------------------------------------------------ */
+
+const RAW_LETTERS_THRESHOLD = 0.55;
+
+function bagOfCharsSimilarity(a, b) {
+  if (!a.length || !b.length) return 0;
+
+  const freqA = new Map();
+  for (const ch of a) freqA.set(ch, (freqA.get(ch) ?? 0) + 1);
+
+  let shared = 0;
+  const freqB = new Map();
+  for (const ch of b) freqB.set(ch, (freqB.get(ch) ?? 0) + 1);
+  for (const [ch, countA] of freqA) {
+    const countB = freqB.get(ch) ?? 0;
+    shared += Math.min(countA, countB);
+  }
+
+  return (2 * shared) / (a.length + b.length);
+}
+
+// IMPORTANTE — por que não é só "bag of chars" sozinho: testei e um "saco de
+// letras" puro é traiçoeiro (arroz, feijão, café... todo produto tem A, O,
+// E, R, T, C, L de sobra — português é cheio de letra repetida), e sozinho
+// ele podia até achar "ARROZ TIO JOÃO 5KG" mais parecido com "COCA-COLA
+// ZERO" do que o produto certo. Por isso o score final combina bag-of-chars
+// com bigrama E trigrama (que já existem no app, ver charBigramSet/
+// charTrigramSet mais acima) — esses dois exigem que as letras em comum
+// estejam GRUDADAS na mesma ordem (par ou trio), não só soltas em qualquer
+// lugar do texto, o que derruba drasticamente o falso positivo mantendo a
+// tolerância a OCR embaralhada que era o objetivo desse último recurso.
+function rawLetterSimilarity(rawA, rawB) {
+  const upperA = normalizeProductText(rawA).replace(/\s+/g, '');
+  const upperB = normalizeProductText(rawB).replace(/\s+/g, '');
+  if (!upperA || !upperB) return 0;
+
+  const bagScore = bagOfCharsSimilarity(upperA, upperB);
+  const biScore = bigramJaccardSimilarity(upperA, upperB);
+  const triScore = trigramJaccardSimilarity(upperA, upperB);
+  let score = bagScore * 0.35 + biScore * 0.3 + triScore * 0.35;
+
+  // Mesma penalidade "matadora" de ML das outras camadas — barata e é o
+  // sinal mais confiável que existe, mesmo no método mais simples de todos.
+  const mlA = extractMl(normalizeProductText(rawA));
+  const mlB = extractMl(normalizeProductText(rawB));
+  if (mlA !== null && mlB !== null && mlA !== mlB) score *= 0.25;
+
+  return Math.max(0, Math.min(1, score));
+}
+
+async function findBestMatchByRawLetters(recognizedText) {
+  const rows = await listAllProductsCached();
+  let best = null;
+  let bestScore = -1;
+  for (const row of rows) {
+    if (!row.produto) continue;
+    const score = rawLetterSimilarity(recognizedText, row.produto);
+    if (score > bestScore) {
+      bestScore = score;
+      best = row;
+    }
+  }
+  if (!best || bestScore < RAW_LETTERS_THRESHOLD) {
+    return { found: false, score: bestScore < 0 ? null : bestScore, product: null };
+  }
+  return { found: true, score: bestScore, product: best };
+}
+
+/* ------------------------------------------------------------------------ */
+/* MODO INTELIGENTE — "CAMADA 0": MEMÓRIA LOCAL DE CONFIRMAÇÕES (aprendizado) */
+/*                                                                            */
+/* Motivo de existir: a camada de IA/web (Groq + SerpApi, mais abaixo)       */
+/* depende de cota e de internet — e cota de API um dia acaba ou falha.      */
+/* Esta camada guarda, DENTRO DO PRÓPRIO APARELHO (AsyncStorage, sem         */
+/* servidor nenhum), o texto que a OCR leu de cada produto que JÁ foi        */
+/* confirmado por um humano (seja tocando em "É este produto" seja           */
+/* enviando manualmente na tela de preço) junto com o código do produto      */
+/* certo. Da PRÓXIMA vez que a câmera ler um texto parecido (mesma           */
+/* prateleira, mesma etiqueta, mesmo jeito de a OCR errar aquele rótulo),    */
+/* o app reconhece SOZINHO, sem gastar Groq nem SerpApi — e continua         */
+/* funcionando exatamente igual no dia em que a cota do SerpApi acabar de    */
+/* vez ou a internet cair no meio da loja. Quanto mais o app é usado, menos  */
+/* ele depende de qualquer serviço externo pra reconhecer os produtos que    */
+/* já viu antes.                                                            */
+/* ------------------------------------------------------------------------ */
+
+const LEARNED_MATCHES_STORAGE_KEY = 'preco-certo:aprendizado-ocr';
+const LEARNED_MATCHES_MAX = 500; // teto de segurança pro AsyncStorage não crescer sem limite
+// Piso mais EXIGENTE que o do casamento "direto" (0.65) — aqui é memória de
+// algo que um humano já confirmou de verdade, então só reaproveita quando a
+// semelhança com o texto lido agora é muito forte (evita "aprender errado"
+// a colar uma correção antiga em uma foto de produto diferente).
+const LEARNED_MATCH_THRESHOLD = 0.8;
+
+let learnedMatchesCache = null; // carregado 1x do AsyncStorage, depois fica em memória
+
+async function loadLearnedMatches() {
+  if (learnedMatchesCache) return learnedMatchesCache;
+  try {
+    const raw = await AsyncStorage.getItem(LEARNED_MATCHES_STORAGE_KEY);
+    learnedMatchesCache = raw ? JSON.parse(raw) : [];
+  } catch {
+    learnedMatchesCache = [];
+  }
+  return learnedMatchesCache;
+}
+
+/**
+ * Grava (ou atualiza) uma correspondência confirmada por humano: texto lido
+ * pela OCR -> código do produto certo. Chamado na tela de confirmar preço
+ * sempre que o usuário efetivamente envia um produto que veio de uma foto do
+ * Modo Inteligente — tanto quando a sugestão automática estava certa quanto
+ * quando o usuário corrigiu manualmente pra outro produto (nesse segundo
+ * caso é ainda mais valioso: é justamente o tipo de erro que o app não deve
+ * repetir da próxima vez que ler aquela etiqueta).
+ */
+async function learnFromConfirmedScan(recognizedText, codigo, produto) {
+  const text = (recognizedText ?? '').trim();
+  if (!text || !codigo) return; // sem texto lido ou sem código, não tem o que aprender
+  const normalized = normalizeProductText(text);
+  if (!normalized) return;
+  try {
+    const list = await loadLearnedMatches();
+    // Se já existe uma entrada muito parecida com esse mesmo texto, ATUALIZA
+    // em vez de duplicar — evita a lista crescer com quase-repetições da
+    // mesma etiqueta fotografada de novo, e corrige na hora se uma correção
+    // antiga estava errada.
+    const existingIdx = list.findIndex((entry) => similarity(entry.normalized, normalized) >= 0.92);
+    const entry = { normalized, codigo: String(codigo), produto: produto ?? null, updatedAt: Date.now() };
+    if (existingIdx >= 0) {
+      list[existingIdx] = entry;
+    } else {
+      list.unshift(entry);
+      if (list.length > LEARNED_MATCHES_MAX) list.length = LEARNED_MATCHES_MAX;
+    }
+    learnedMatchesCache = list;
+    await AsyncStorage.setItem(LEARNED_MATCHES_STORAGE_KEY, JSON.stringify(list));
+  } catch {
+    // Aprendizado é "bônus" — se falhar (ex.: storage cheio), não deve
+    // travar o fluxo de envio do preço, que já terminou com sucesso.
+  }
+}
+
+/**
+ * Procura, na memória local deste aparelho, um texto já confirmado antes
+ * que seja MUITO parecido com o texto lido agora. Não usa IA nem internet —
+ * só Levenshtein contra o que já foi aprendido, então funciona mesmo sem
+ * rede nenhuma.
+ */
+async function findLearnedMatch(recognizedText) {
+  const text = (recognizedText ?? '').trim();
+  if (!text) return null;
+  const normalized = normalizeProductText(text);
+  if (!normalized) return null;
+  const list = await loadLearnedMatches();
+  let best = null;
+  let bestSim = 0;
+  for (const entry of list) {
+    const sim = similarity(normalized, entry.normalized);
+    if (sim > bestSim) {
+      bestSim = sim;
+      best = entry;
+    }
+  }
+  if (!best || bestSim < LEARNED_MATCH_THRESHOLD) return null;
+  const product = await findProductByCodigo(best.codigo);
+  if (!product) return null; // produto pode ter sido excluído/renomeado no Baserow depois
+  return { product, score: bestSim };
+}
+
+/* ------------------------------------------------------------------------ */
 /* MODO INTELIGENTE — ORQUESTRADOR: junta as 3 camadas numa função só         */
 /*                                                                            */
 /* Ordem de tentativa (só avança pra próxima camada se a anterior não achou   */
@@ -2192,7 +2550,8 @@ async function findBestMatchBySyllable(recognizedText) {
 /*        direto no Baserow (igual a ter bipado o código de verdade);        */
 /*      - testa cada candidato de nome (original, IA, títulos da web) contra */
 /*        o Baserow e fica com o de maior score.                            */
-/*   3. Último recurso: casamento por SÍLABA (original e/ou versão da IA).   */
+/*   3. Casamento por SÍLABA (original e/ou versão da IA).                   */
+/*   4. Última alternativa: produto com mais LETRAS EM COMUM (bag of chars). */
 /* Devolve sempre { found, score, product, stage }, onde "stage" diz qual    */
 /* camada resolveu — útil pra mostrar na tela como o produto foi achado.     */
 /* ------------------------------------------------------------------------ */
@@ -2210,6 +2569,14 @@ async function enrichRecognizedText(recognizedText) {
     const byGtinNaFoto = await findProductByCodigo(gtinNaFoto);
     if (byGtinNaFoto) return { found: true, score: 1, product: byGtinNaFoto, stage: 'codigo-na-foto' };
   }
+
+  // FATOR EXTRA DE RECONHECIMENTO — memória local de confirmações (ver bloco
+  // "CAMADA 0" acima). Roda ANTES de qualquer chamada de IA/web: se já vimos
+  // (e um humano já confirmou) um texto muito parecido com este antes, usa
+  // direto — mais rápido, e não depende do Groq/SerpApi estarem no ar nem
+  // terem cota sobrando.
+  const learned = await findLearnedMatch(recognizedText);
+  if (learned) return { found: true, score: learned.score, product: learned.product, stage: 'aprendido' };
 
   // FATOR EXTRA DE PRECISÃO — anula de vez a leitura se ela for majoritariamente
   // "ruído" (letras aleatórias sem cara de palavra real, tipo
@@ -2265,6 +2632,21 @@ async function enrichRecognizedText(recognizedText) {
     }
   }
   if (bestSyllable.found) return { ...bestSyllable, stage: 'silaba' };
+
+  // ÚLTIMA ALTERNATIVA DE VERDADE: nada bateu por palavra nem por sílaba —
+  // tenta achar, no catálogo, o produto com mais LETRAS EM COMUM com o texto
+  // lido (e, se a IA corrigiu algo, testa a versão dela também). Ver bloco
+  // grande de comentário acima de findBestMatchByRawLetters pra entender por
+  // que esse método ainda funciona quando os outros desistem.
+  const rawLetterCandidates = [recognizedText, aiGuess].filter(Boolean);
+  let bestRawLetters = { found: false, score: null, product: null };
+  for (const text of rawLetterCandidates) {
+    const attempt = await findBestMatchByRawLetters(text);
+    if (attempt.found && (!bestRawLetters.found || attempt.score > bestRawLetters.score)) {
+      bestRawLetters = attempt;
+    }
+  }
+  if (bestRawLetters.found) return { ...bestRawLetters, stage: 'letras-parecidas' };
 
   return { found: false, score: direct.score, product: null, stage: 'nenhum' };
 }
@@ -2681,11 +3063,13 @@ const isSmartModeSupported = !!isTextExtractorSupported;
 // precisar de reforço nenhum.
 const STAGE_LABELS = {
   direto: null,
+  aprendido: 'Reconhecido pela memória do app',
   'codigo-na-foto': 'Código de barras lido na foto',
   'ia-ocr': 'Corrigido por IA',
   'busca-web': 'Confirmado por busca na web',
   'ean-web': 'Código de barras achado na web',
   silaba: 'Casamento por sílaba',
+  'letras-parecidas': 'Correspondência aproximada — confira antes de confirmar',
 };
 
 /**
@@ -2905,10 +3289,11 @@ function ScannerScreen(props) {
 /* ------------------------------------------------------------------------ */
 
 // LIVE_MATCH_THROTTLE_MS: intervalo mínimo entre chamadas ao pipeline de OCR
-// pesado (IA + Baserow). Aumentado de 900 → 1100ms pra reduzir o número de
-// chamadas de rede sem perder responsividade perceptível (a pessoa não vê
-// diferença abaixo de ~1s, mas o app trava muito menos por contenção de rede).
-const LIVE_MATCH_THROTTLE_MS = 1100;
+// pesado (IA + Baserow). Reduzido de 1100 → 850ms a pedido: escaneamento
+// mais rápido. Não abaixamos mais que isso pra não voltar a ter contenção
+// de rede/travamento (abaixo de ~700-800ms o ganho de velocidade percebido
+// é pequeno e o risco de sobrecarregar a chamada de IA/Baserow sobe rápido).
+const LIVE_MATCH_THROTTLE_MS = 850;
 // LIVE_BOX_THROTTLE_MS: intervalo mínimo entre atualizações visuais das
 // caixinhas "LIDO". Aumentado de 120 → 150ms pra reduzir re-renders sem
 // deixar a animação parecer lenta (abaixo de ~6fps o olho percebe gaguejo).
@@ -3490,10 +3875,10 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                   nearCandidates={[]}
                 />
                 <View style={styles.suggestionActions}>
-                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}>
+                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}>
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
                   </Pressable>
-                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado })}>
+                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}>
                     <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
                       <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>É este produto</Text>
                     </LinearGradient>
@@ -3645,10 +4030,11 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   // testa contra o catálogo, e atualiza a barra de confiança na hora. Pra
   // quem está usando, PARECE tempo real (não precisa tocar em nada, a
   // resposta é rápida), mesmo não sendo frame-a-frame de verdade.
-  // Aumentado de 1300 → 1500ms: reduz a quantidade de fotos tiradas por minuto
-  // sem mudar a percepção de "tempo real" (abaixo de ~2s a pessoa não sente).
-  // Menos fotos = menos decodificação de JPEG = menos uso de CPU = sem travamento.
-  const SMART_LIVE_INTERVAL_MS = 1500;
+  // Reduzido de 1500 → 1150ms a pedido: escaneamento mais rápido. Ainda
+  // fica acima de ~1s pra não voltar a sobrecarregar de foto (mais fotos =
+  // mais decodificação de JPEG = mais uso de CPU = risco de travamento),
+  // mas perceptivelmente mais ágil que antes.
+  const SMART_LIVE_INTERVAL_MS = 1150;
 
   const captureLiveFrame = useCallback(async () => {
     if (smartLoopBusyRef.current || lockedRef.current) return;
@@ -3929,7 +4315,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                   <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => setSuggestion(null)}>
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Tentar de novo</Text>
                   </Pressable>
-                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}>
+                  <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}>
                     <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
                       <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>Cadastrar manualmente</Text>
                     </LinearGradient>
@@ -4007,13 +4393,13 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                 <View style={styles.suggestionActions}>
                   <Pressable
                     style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]}
-                    onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}
+                    onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}
                   >
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
                   </Pressable>
                   <Pressable
                     style={{ flex: 1 }}
-                    onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado })}
+                    onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}
                   >
                     <LinearGradient colors={[colors.accent, '#ff9d1f']} style={styles.suggestionPrimaryButton}>
                       <Text style={{ color: colors.accentForeground, fontFamily: 'Inter_700Bold' }}>É este produto</Text>
@@ -4122,6 +4508,17 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
         await updateProduct({ id: data.id, data: { produto: produtoFinal, preco, ml, quantidade } });
       } else {
         await createProduct({ codigo: codigoInput.trim(), produto: produtoFinal, preco, ml, quantidade });
+      }
+      // FATOR EXTRA DE RECONHECIMENTO — aprendizado local (ver bloco "CAMADA 0"
+      // / learnFromConfirmedScan). Só faz sentido quando este envio veio de
+      // uma foto do Modo Inteligente (params.recognizedText existe) e já se
+      // sabe o código certo do produto (codigoInput ou o que já estava
+      // salvo). Vale tanto quando a sugestão automática estava certa quanto
+      // quando o usuário corrigiu manualmente — os dois casos ensinam o app.
+      // Roda em segundo plano (não usa "await" nem trava o "Preço enviado!").
+      const codigoAprendido = (codigoInput || '').trim() || data?.codigo || null;
+      if (params.recognizedText && codigoAprendido) {
+        learnFromConfirmedScan(params.recognizedText, codigoAprendido, produtoFinal).catch(() => {});
       }
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       setSubmitted(true);
@@ -4698,9 +5095,11 @@ export default function App() {
   // produto já cadastrado no Baserow (considerando ML e variante — ver
   // findBestMatchByProductText). Não usa código de barras nenhum.
   const suggestProductByText = useCallback(async (recognizedText) => {
-    // enrichRecognizedText tenta, em ordem: casamento direto → IA corretora
-    // de OCR + busca real na web (SerpApi) → casamento por sílaba. Só avança
-    // pra próxima camada se a anterior não achou nada com confiança.
+    // enrichRecognizedText tenta, em ordem: código na foto → memória local
+    // de confirmações (aprendizado, sem internet) → casamento direto → IA
+    // corretora de OCR + busca real na web (SerpApi) → casamento por
+    // sílaba → última alternativa por letras em comum. Só avança pra
+    // próxima camada se a anterior não achou nada com confiança.
     const match = await enrichRecognizedText(recognizedText);
     return {
       found: match.found,
