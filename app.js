@@ -1420,6 +1420,30 @@ let productsCache = {
 };
 const PRODUCTS_CACHE_TTL_MS = 30000; // 30s (era 15s — reduz chamadas à API)
 
+/* ------------------------------------------------------------------------ */
+/* CACHE DE FREQUÊNCIA DE TOKENS — calculado UMA VEZ, reutilizado            */
+/*                                                                            */
+/* Antes era recalculado dentro de findBestMatchByProductText a cada scan —  */
+/* ou seja, a cada ~1.1s no modo tempo real (LIVE_MATCH_THROTTLE_MS). Como   */
+/* o catálogo não muda durante uma sessão, calculamos uma vez e guardamos.   */
+/* Invalida junto com o productsCache (quando produtos novos são cadastrados).*/
+/* ------------------------------------------------------------------------ */
+let _tokenFrequencyCache = null; // { df, totalProducts, rowCount }
+
+function getTokenFrequency(rows) {
+  const count = rows.length;
+  if (_tokenFrequencyCache && _tokenFrequencyCache.rowCount === count) {
+    return _tokenFrequencyCache;
+  }
+  const freq = buildTokenDocumentFrequency(rows);
+  _tokenFrequencyCache = { ...freq, rowCount: count };
+  return _tokenFrequencyCache;
+}
+
+function invalidateTokenFrequencyCache() {
+  _tokenFrequencyCache = null;
+}
+
 async function listAllProductsCached() {
   const now = Date.now();
   if (productsCache && now - productsCache.fetchedAt < PRODUCTS_CACHE_TTL_MS) {
@@ -1440,6 +1464,7 @@ async function listAllProductsCached() {
 function invalidateProductsCache() {
   // Preserva o snapshot local mas força refresh do Baserow na próxima chamada.
   productsCache = { rows: LOCAL_PRODUCTS_SNAPSHOT, fetchedAt: 0, fromSnapshot: true };
+  invalidateTokenFrequencyCache(); // token frequency deve ser recalculada junto
 }
 
 async function findBestMatchByCodigo(codigo) {
@@ -1830,21 +1855,51 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
  * via expo-text-extractor) e procura, no catálogo já salvo no Baserow, o
  * produto cujo NOME é mais parecido — considerando ML e variante, não só a
  * string crua. Não depende de código de barras nenhum.
+ *
+ * MELHORIAS DE VELOCIDADE E PRECISÃO:
+ *  1. Usa `getTokenFrequency` (cache) em vez de `buildTokenDocumentFrequency`
+ *     a cada chamada — elimina O(N) de reconstrução no caminho crítico.
+ *  2. Saída antecipada: se encontrar score >= 0.97 (praticamente certeza),
+ *     para de comparar o resto do catálogo na hora — economiza iterações.
+ *  3. Pré-filtra marcas conhecidas: se o texto lido contiver uma marca do
+ *     dicionário, inicia a busca pelos produtos dessa marca (eles ficam no
+ *     topo da lista de candidatos) antes de varrer o catálogo todo.
  */
 async function findBestMatchByProductText(recognizedText) {
   const rows = await listAllProductsCached();
-  // Calcula UMA VEZ a raridade de cada palavra no catálogo inteiro, e reusa
-  // pra todas as linhas — assim uma palavra genérica (ZERO, PET, REFRI) não
-  // pesa tanto quanto a palavra que realmente diferencia os produtos entre si.
-  const tokenFrequency = buildTokenDocumentFrequency(rows);
+  // tokenFrequency agora vem do cache — não recalcula a cada scan.
+  const tokenFrequency = getTokenFrequency(rows);
+
+  // FATOR EXTRA DE VELOCIDADE — Pré-detecção de marca: se o texto lido
+  // contiver uma marca conhecida, coloca os produtos dessa marca na frente da
+  // fila de comparação. O resto do catálogo ainda é comparado (pra não perder
+  // nada), mas se a marca for forte o produto certo costuma sair logo nos
+  // primeiros candidatos → saída antecipada resolve mais rápido.
+  const normalizedInput = normalizeProductText(recognizedText);
+  const allBrands = [
+    ...BRANDS.LEITE, ...BRANDS.CERVEJA, ...BRANDS.REFRIGERANTE, ...BRANDS.AGUA,
+  ];
+  let detectedBrand = null;
+  for (const brand of allBrands.sort((a, b) => b.length - a.length)) {
+    if (normalizedInput.includes(brand.replace(/\s+/g, ' '))) { detectedBrand = brand; break; }
+  }
+  const sortedRows = detectedBrand
+    ? [
+        ...rows.filter((r) => r.produto && toSearchableUpper(r.produto).includes(detectedBrand)),
+        ...rows.filter((r) => r.produto && !toSearchableUpper(r.produto).includes(detectedBrand)),
+      ]
+    : rows;
+
   let best = null;
   let bestScore = -1;
-  for (const row of rows) {
+  const EARLY_EXIT_SCORE = 0.97; // score tão alto que não vale a pena continuar
+  for (const row of sortedRows) {
     if (!row.produto) continue;
     const score = productTextSimilarity(recognizedText, row.produto, tokenFrequency);
     if (score > bestScore) {
       bestScore = score;
       best = row;
+      if (bestScore >= EARLY_EXIT_SCORE) break; // saída antecipada — praticamente certeza
     }
   }
   if (!best || bestScore < TEXT_SUGGESTION_THRESHOLD) {
@@ -2215,6 +2270,117 @@ async function enrichRecognizedText(recognizedText) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* FILTRO DE QUALIDADE — só aceita o resultado se tiver ML + PREÇO + MARCA   */
+/*                                                                            */
+/* Evita travamento em texto genérico que casou "por coincidência" sem       */
+/* informação suficiente pra identificar o produto com segurança.            */
+/* Os 3 critérios:                                                           */
+/*   • ML   — volume extraído do texto OCR OU registrado no produto          */
+/*   • PREÇO — preço lido na etiqueta OU já salvo no sistema                 */
+/*   • MARCA — nome do produto contém uma marca conhecida do dicionário      */
+/* Só quando os 3 estiverem presentes o app "trava" e exibe o resultado.    */
+/* ------------------------------------------------------------------------ */
+
+function hasRequiredScanFields(product, recognizedText) {
+  if (!product) return false;
+
+  // 1. ML — no produto cadastrado OU no texto lido pela câmera
+  const mlInText = extractMl(normalizeProductText(recognizedText)) !== null;
+  const mlInProduct = product.ml !== null && product.ml !== undefined;
+  if (!mlInText && !mlInProduct) return false;
+
+  // 2. PREÇO — lido na etiqueta (texto OCR) OU já salvo no Baserow
+  const precoInText = extractPriceFromText(recognizedText) !== null;
+  const precoInProduct = product.preco !== null && product.preco !== undefined;
+  if (!precoInText && !precoInProduct) return false;
+
+  // 3. MARCA — nome do produto contém alguma marca do dicionário
+  const nomeProduto = toSearchableUpper(product.produto ?? '');
+  const allBrands = [
+    ...BRANDS.LEITE, ...BRANDS.CERVEJA, ...BRANDS.REFRIGERANTE, ...BRANDS.AGUA,
+  ];
+  const hasMarca = allBrands.some((brand) => nomeProduto.includes(brand.replace(/\s+/g, ' ')));
+  if (!hasMarca) return false;
+
+  return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* IA DE RACIOCÍNIO — explica POR QUE escolheu o produto (Groq/Llama)        */
+/*                                                                            */
+/* Recebe o texto lido pela OCR, o produto escolhido e até 4 outros          */
+/* candidatos que chegaram perto, e pede pra IA explicar os sinais que       */
+/* levaram à escolha — marca, volume, variante, preço lido na etiqueta.      */
+/* A resposta é devolvida como string simples (não streaming) e o efeito de  */
+/* "digitação" é feito pelo componente AIReasoningPanel com setInterval,     */
+/* que é a forma mais confiável de simular streaming em React Native.        */
+/* Se a chamada falhar, devolve null e o painel simplesmente não aparece.    */
+/* ------------------------------------------------------------------------ */
+
+const REASONING_SYSTEM_PROMPT = [
+  'Você é o assistente do app "Preço Certo" de um supermercado brasileiro.',
+  'Sua tarefa: explicar, de forma MUITO CURTA (2-3 frases diretas, sem introdução),',
+  'por que o produto escolhido é a melhor correspondência para o texto que a câmera leu.',
+  'Seja específico: cite os sinais concretos que confirmaram a escolha (ML/volume igual,',
+  'marca reconhecida, variante batendo, preço lido na etiqueta etc.).',
+  'Escreva em português informal, como um assistente rápido de caixa.',
+  'NUNCA use "Olá", "Claro", "Com certeza" nem introduções — vá direto ao ponto.',
+  'Não repita o nome do produto no começo. Máximo de 60 palavras.',
+].join(' ');
+
+async function getAIMatchReasoning(recognizedText, product, nearCandidates) {
+  const text = (recognizedText ?? '').trim();
+  const nome = product?.produto ?? '';
+  if (!text || !nome) return null;
+
+  const candidateList = (nearCandidates ?? [])
+    .filter((c) => c.produto && c.produto !== nome)
+    .slice(0, 4)
+    .map((c) => c.produto)
+    .join(', ');
+
+  const userContent = [
+    `Texto lido pela câmera: "${text}"`,
+    `Produto escolhido: "${nome}"`,
+    product?.ml ? `Volume registrado: ${formatVolume(product.ml)}` : '',
+    candidateList ? `Outros candidatos descartados: ${candidateList}` : '',
+    'Por que este produto foi escolhido?',
+  ].filter(Boolean).join('\n');
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        temperature: 0.5,
+        max_tokens: 100,
+        messages: [
+          { role: 'system', content: REASONING_SYSTEM_PROMPT },
+          { role: 'user', content: userContent },
+        ],
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const raw = data?.choices?.[0]?.message?.content?.trim();
+    if (!raw || raw.length < 10) return null;
+    return raw;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
 /* MANUTENÇÃO — limpar todos os preços da planilha de uma vez                */
 /* ------------------------------------------------------------------------ */
 
@@ -2247,6 +2413,84 @@ async function clearAllPrices(onProgress) {
 /* ------------------------------------------------------------------------ */
 /* COMPONENTES REUTILIZÁVEIS                                                 */
 /* ------------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------------ */
+/* EFEITO TYPEWRITER — "digita" o texto progressivamente                      */
+/* ------------------------------------------------------------------------ */
+
+function useTypewriter(text, speed = 22) {
+  const [displayed, setDisplayed] = useState('');
+  const indexRef = useRef(0);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    // Reseta sempre que o texto mudar
+    setDisplayed('');
+    indexRef.current = 0;
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (!text) return undefined;
+
+    intervalRef.current = setInterval(() => {
+      indexRef.current += 1;
+      setDisplayed(text.slice(0, indexRef.current));
+      if (indexRef.current >= text.length) clearInterval(intervalRef.current);
+    }, speed);
+
+    return () => clearInterval(intervalRef.current);
+  }, [text, speed]);
+
+  const isDone = displayed.length === (text ? text.length : 0);
+  return { displayed, isDone };
+}
+
+/* ------------------------------------------------------------------------ */
+/* PAINEL DE RACIOCÍNIO DA IA — mostra por que o produto foi escolhido        */
+/* Aparece no cartão de resultado após o produto ser identificado.           */
+/* A IA "pensa" (busca o raciocínio) e depois o texto vai sendo "digitado"   */
+/* na tela, token a token, como se estivesse escrevendo ao vivo.             */
+/* ------------------------------------------------------------------------ */
+
+function AIReasoningPanel({ product, recognizedText, nearCandidates }) {
+  const [reasoning, setReasoning] = useState(null); // null = carregando
+  const { displayed, isDone } = useTypewriter(reasoning ?? '', 20);
+
+  useEffect(() => {
+    if (!product) return;
+    setReasoning(null);
+    let cancelled = false;
+    getAIMatchReasoning(recognizedText, product, nearCandidates)
+      .then((result) => { if (!cancelled) setReasoning(result ?? ''); })
+      .catch(() => { if (!cancelled) setReasoning(''); });
+    return () => { cancelled = true; };
+  }, [product?.id, product?.produto]);
+
+  if (reasoning === '' || reasoning === null && displayed === '') {
+    // Enquanto busca — indicador discreto
+    return reasoning === null ? (
+      <View style={styles.aiReasoningBox}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <ActivityIndicator size="small" color="#8b5cf6" />
+          <Text style={styles.aiReasoningLabel}>IA analisando o motivo…</Text>
+        </View>
+      </View>
+    ) : null;
+  }
+
+  return (
+    <View style={styles.aiReasoningBox}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 5 }}>
+        <Icon name="zap" size={11} color="#8b5cf6" />
+        <Text style={styles.aiReasoningLabel}>POR QUE ESCOLHI ESTE PRODUTO</Text>
+      </View>
+      <Text style={styles.aiReasoningText}>
+        {displayed}
+        {!isDone ? (
+          <Text style={{ color: '#8b5cf6', fontFamily: 'Inter_700Bold' }}>▌</Text>
+        ) : null}
+      </Text>
+    </View>
+  );
+}
 
 function ScanFrame({ locked, mode, analyzing = false }) {
   const isSmart = mode === 'smart';
@@ -2946,7 +3190,8 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
       .then((best) => {
         if (lockedRef.current) return;
         setLiveStatus({ analyzing: false, score: best.score ?? null });
-        if (best.found && best.produto) {
+        // FILTRO DE QUALIDADE: só trava se encontrar ML + PREÇO + MARCA
+        if (best.found && best.produto && hasRequiredScanFields(best, trimmed)) {
           lockedRef.current = true;
           setLocked(true);
           Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
@@ -2961,6 +3206,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
             quantidade: best.quantidade ?? null,
             score: best.score ?? null,
             stage: best.stage ?? null,
+            productObj: best,
           });
         }
       })
@@ -3238,6 +3484,11 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                     style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 2 }}
                   />
                 </View>
+                <AIReasoningPanel
+                  product={suggestion.productObj}
+                  recognizedText={suggestion.recognizedText ?? ''}
+                  nearCandidates={[]}
+                />
                 <View style={styles.suggestionActions}>
                   <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado })}>
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
@@ -3348,7 +3599,8 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
 
       const best = await suggestProductByText(recognizedText);
 
-      if (best.found && best.produto) {
+      // FILTRO DE QUALIDADE: só trava se encontrar ML + PREÇO + MARCA
+      if (best.found && best.produto && hasRequiredScanFields(best, recognizedText)) {
         lockedRef.current = true;
         setLocked(true);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
@@ -3363,6 +3615,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
           quantidade: best.quantidade ?? null,
           score: best.score ?? null,
           stage: best.stage ?? null,
+          productObj: best,
         });
       } else {
         setSuggestion({
@@ -3427,7 +3680,8 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
       const best = await suggestProductByText(recognizedText);
       setLiveStatus({ analyzing: false, score: best.score ?? null });
 
-      if (best.found && best.produto && !lockedRef.current) {
+      // FILTRO DE QUALIDADE: só trava se encontrar ML + PREÇO + MARCA
+      if (best.found && best.produto && !lockedRef.current && hasRequiredScanFields(best, recognizedText)) {
         lockedRef.current = true;
         setLocked(true);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
@@ -3442,6 +3696,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
           quantidade: best.quantidade ?? null,
           score: best.score ?? null,
           stage: best.stage ?? null,
+          productObj: best,
         });
       }
     } catch {
@@ -3744,6 +3999,11 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                     style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 2 }}
                   />
                 </View>
+                <AIReasoningPanel
+                  product={suggestion.productObj}
+                  recognizedText={suggestion.recognizedText ?? ''}
+                  nearCandidates={[]}
+                />
                 <View style={styles.suggestionActions}>
                   <Pressable
                     style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]}
@@ -4617,6 +4877,27 @@ const styles = StyleSheet.create({
   suggestionProductName: { fontSize: 16, fontFamily: 'Inter_700Bold', color: colors.foreground },
   suggestionProductPrice: { fontSize: 20, fontFamily: 'Inter_700Bold', color: colors.success },
   suggestionActions: { flexDirection: 'row', gap: 10 },
+  aiReasoningBox: {
+    marginTop: 10,
+    marginBottom: 2,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: 'rgba(139,92,246,0.10)',
+    borderWidth: 1,
+    borderColor: 'rgba(139,92,246,0.25)',
+  },
+  aiReasoningLabel: {
+    fontSize: 9,
+    fontFamily: 'Inter_700Bold',
+    color: '#8b5cf6',
+    letterSpacing: 0.8,
+  },
+  aiReasoningText: {
+    fontSize: 12,
+    fontFamily: 'Inter_400Regular',
+    color: '#e2e8f0',
+    lineHeight: 17,
+  },
   suggestionSecondaryButton: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14, borderWidth: 1 },
   suggestionPrimaryButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14 },
   scanContainer: { alignItems: 'center', justifyContent: 'center', gap: 14 },
