@@ -421,6 +421,8 @@ function renderGlyph(name, color) {
           <Line x1={12} y1={20} x2={12.01} y2={20} {...p} />
         </>
       );
+    case 'zap':
+      return <Polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" {...p} />;
     case 'x':
       return (
         <>
@@ -1268,6 +1270,81 @@ function deriveProductFromCosmos(cosmos) {
 /* MODO INTELIGENTE — melhor correspondência por similaridade (Levenshtein)  */
 /* ------------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------------ */
+/* FATOR EXTRA DE PRECISÃO — DETECTOR DE "RUÍDO" (letras aleatórias)         */
+/*                                                                            */
+/* Às vezes a OCR lê algo que não é texto nenhum de verdade — risco na       */
+/* etiqueta, textura da embalagem, dedo tampando parte da foto — e devolve   */
+/* uma sequência de letras sem nexo, tipo "sdwedfrfdfsdcxa". Palavra real do */
+/* português (mesmo com erro de OCR) sempre tem vogal espalhada com uma      */
+/* frequência mínima e não empilha consoante direto por muito tempo; "lixo"  */
+/* de leitura tende a ter quase nenhuma vogal e/ou uma sequência enorme de   */
+/* consoante seguida. Detectando isso, o app ANULA essa leitura em vez de    */
+/* tentar (e arriscar errar) casar ela com um produto do catálogo — e também */
+/* evita gastar chamada de IA/web à toa com lixo.                           */
+/* ------------------------------------------------------------------------ */
+
+const VOWELS_SET = new Set(['A', 'E', 'I', 'O', 'U']);
+
+// Abaixo desse tamanho não dá pra confiar no teste de vogal/consoante — tem
+// abreviação de verdade sem vogal nenhuma (ML, KG, UN, PET, CX, LN...), então
+// só palavras "grandes o suficiente" pra um julgamento seguro entram aqui.
+const GIBBERISH_MIN_WORD_LENGTH = 5;
+// Português raramente empilha mais que 3-4 consoantes seguidas (ex.:
+// "TRANSC-", "INSTR-"); 5+ seguidas é forte sinal de ruído de OCR.
+const GIBBERISH_MAX_CONSONANT_RUN = 5;
+// Palavra real do português quase sempre tem pelo menos ~1 vogal a cada 6
+// letras; abaixo disso é sinal de ruído.
+const GIBBERISH_MIN_VOWEL_RATIO = 0.16;
+// Se 60% ou mais das palavras "julgáveis" (grandes o suficiente) do texto
+// inteiro parecem ruído, o texto inteiro é tratado como ruído.
+const GIBBERISH_TEXT_REJECT_RATIO = 0.6;
+
+function longestConsonantRun(word) {
+  let longest = 0;
+  let current = 0;
+  for (const ch of word) {
+    if (/[A-Z]/.test(ch) && !VOWELS_SET.has(ch)) {
+      current += 1;
+      if (current > longest) longest = current;
+    } else {
+      current = 0;
+    }
+  }
+  return longest;
+}
+
+/** Só julga palavra "pura de letra" (A-Z) com tamanho suficiente — número, código, unidade curta nunca entra aqui. */
+function isGibberishWord(word) {
+  if (word.length < GIBBERISH_MIN_WORD_LENGTH || !/^[A-Z]+$/.test(word)) return false;
+  let vowels = 0;
+  for (const ch of word) if (VOWELS_SET.has(ch)) vowels += 1;
+  if (vowels / word.length < GIBBERISH_MIN_VOWEL_RATIO) return true;
+  if (longestConsonantRun(word) >= GIBBERISH_MAX_CONSONANT_RUN) return true;
+  return false;
+}
+
+/** Remove do texto (já normalizado/maiúsculo) as palavras que parecem ruído — usado só no texto LIDO, nunca no nome do catálogo. */
+function stripGibberishWords(normalizedUpperText) {
+  const words = normalizedUpperText.split(' ').filter(Boolean);
+  const kept = words.filter((w) => !isGibberishWord(w));
+  return kept.join(' ');
+}
+
+/**
+ * Decide se o texto INTEIRO lido (bruto, ainda sem normalizar) parece ser
+ * majoritariamente ruído de OCR — usado como "válvula de segurança" logo no
+ * começo do pipeline, pra anular de vez a leitura antes de gastar IA/web ou
+ * arriscar um casamento por acaso com o catálogo.
+ */
+function isLikelyNoiseText(rawText) {
+  const upper = normalizeProductText(rawText);
+  const judgeable = upper.split(' ').filter((w) => w.length >= GIBBERISH_MIN_WORD_LENGTH && /^[A-Z]+$/.test(w));
+  if (judgeable.length === 0) return false; // nada grande o suficiente pra julgar — não trava a leitura
+  const gibberishCount = judgeable.filter(isGibberishWord).length;
+  return gibberishCount / judgeable.length >= GIBBERISH_TEXT_REJECT_RATIO;
+}
+
 function levenshtein(a, b) {
   const s = a.toLowerCase();
   const t = b.toLowerCase();
@@ -1664,12 +1741,20 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   const upperB = normalizeProductText(rawB);
   if (!upperA || !upperB) return 0;
 
-  const stringScore = similarity(upperA, upperB);
+  // FATOR EXTRA: tira do texto LIDO qualquer palavra que pareça ruído de OCR
+  // (ver bloco "DETECTOR DE RUÍDO" acima) antes de comparar — assim, se a
+  // foto pegou o nome do produto de verdade JUNTO com uma palavra lixo (por
+  // causa de risco, textura, reflexo), o lixo não disputa espaço com as
+  // palavras reais nem some pontos por "não bater com nada". Nunca aplica
+  // isso no nome do catálogo (upperB) — só no que foi lido (upperA).
+  const cleanedA = stripGibberishWords(upperA) || upperA;
+
+  const stringScore = similarity(cleanedA, upperB);
   // FATOR EXTRA: bigrama de caractere — ver comentário em bigramJaccardSimilarity.
   // Pega parte do que o Levenshtein "puro" perde quando as palavras vêm fora
   // de ordem na OCR, sem precisar confiar só no overlapScore por token.
-  const bigramScore = bigramJaccardSimilarity(upperA, upperB);
-  const overlapScore = tokenOverlapScore(upperA, upperB, tokenFrequency);
+  const bigramScore = bigramJaccardSimilarity(cleanedA, upperB);
+  const overlapScore = tokenOverlapScore(cleanedA, upperB, tokenFrequency);
   // overlapScore agora é "recall" (quanto do nome do catálogo foi achado
   // dentro do texto lido — ver comentário em tokenOverlapScore) e por isso é
   // muito mais confiável quando o texto lido tem ruído extra em volta (outras
@@ -2071,6 +2156,16 @@ async function enrichRecognizedText(recognizedText) {
     if (byGtinNaFoto) return { found: true, score: 1, product: byGtinNaFoto, stage: 'codigo-na-foto' };
   }
 
+  // FATOR EXTRA DE PRECISÃO — anula de vez a leitura se ela for majoritariamente
+  // "ruído" (letras aleatórias sem cara de palavra real, tipo
+  // "sdwedfrfdfsdcxa") — ver bloco "DETECTOR DE RUÍDO" acima. Sem código de
+  // barras encontrado (checado acima) e sem nenhuma palavra que pareça de
+  // verdade, não vale a pena arriscar um casamento por acaso nem gastar
+  // IA/busca web à toa — melhor já devolver "não achei" na hora.
+  if (isLikelyNoiseText(recognizedText)) {
+    return { found: false, score: null, product: null, stage: 'ruido' };
+  }
+
   const direct = await findBestMatchByProductText(recognizedText);
   if (direct.found && direct.score >= 0.65) {
     return { ...direct, stage: 'direto' };
@@ -2153,11 +2248,21 @@ async function clearAllPrices(onProgress) {
 /* COMPONENTES REUTILIZÁVEIS                                                 */
 /* ------------------------------------------------------------------------ */
 
-function ScanFrame({ locked, mode }) {
+function ScanFrame({ locked, mode, analyzing = false }) {
   const isSmart = mode === 'smart';
   const frameHeight = isSmart ? 240 : 150;
   const frameWidth = isSmart ? 240 : 260;
   const progress = useRef(new Animated.Value(0)).current;
+  // "Respiração" — glow pulsando devagar por trás do frame, só no modo
+  // Inteligente, pra dar a sensação de "câmera viva, prestando atenção" em
+  // vez de um quadrado estático. Para quando trava (achou o produto).
+  const breathe = useRef(new Animated.Value(0)).current;
+  // Giro do anel pontilhado — só ativa quando `analyzing` (o texto já foi
+  // lido e o Modo Inteligente está processando/casando com o catálogo),
+  // pra dar feedback visual de "pensando" nesse instante específico.
+  const spin = useRef(new Animated.Value(0)).current;
+  // "Pulso de acerto" — bounce rápido quando trava com sucesso.
+  const lockPulse = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     if (locked) return undefined;
@@ -2171,7 +2276,43 @@ function ScanFrame({ locked, mode }) {
     return () => loop.stop();
   }, [locked, progress]);
 
+  useEffect(() => {
+    if (!isSmart || locked) return undefined;
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(breathe, { toValue: 1, duration: 1600, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(breathe, { toValue: 0, duration: 1600, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [isSmart, locked, breathe]);
+
+  useEffect(() => {
+    if (!analyzing || locked) {
+      spin.setValue(0);
+      return undefined;
+    }
+    const loop = Animated.loop(
+      Animated.timing(spin, { toValue: 1, duration: 1100, easing: Easing.linear, useNativeDriver: true }),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [analyzing, locked, spin]);
+
+  useEffect(() => {
+    if (!locked) return;
+    lockPulse.setValue(1);
+    Animated.sequence([
+      Animated.spring(lockPulse, { toValue: 1.12, friction: 3, tension: 140, useNativeDriver: true }),
+      Animated.spring(lockPulse, { toValue: 1, friction: 4, tension: 140, useNativeDriver: true }),
+    ]).start();
+  }, [locked, lockPulse]);
+
   const translateY = progress.interpolate({ inputRange: [0, 1], outputRange: [0, frameHeight - 4] });
+  const glowScale = breathe.interpolate({ inputRange: [0, 1], outputRange: [1, 1.09] });
+  const glowOpacity = breathe.interpolate({ inputRange: [0, 1], outputRange: [0.18, 0.4] });
+  const spinRotate = spin.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
   const borderColor = locked ? colors.success : isSmart ? '#8b5cf6' : colors.accent;
   const lineColor = locked ? colors.success : isSmart ? '#06b6d4' : colors.accent;
 
@@ -2179,16 +2320,42 @@ function ScanFrame({ locked, mode }) {
     <View style={styles.scanContainer} pointerEvents="none">
       {isSmart && !locked && (
         <LinearGradient colors={['#7c3aed', '#06b6d4']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={styles.smartBadge}>
-          <Text style={styles.smartBadgeText}>IA · lê a embalagem</Text>
+          <Icon name="zap" size={11} color="#ffffff" />
+          <Text style={styles.smartBadgeText}>{analyzing ? 'IA · entendendo a leitura…' : 'IA · lê a embalagem'}</Text>
         </LinearGradient>
       )}
-      <View style={[styles.frame, { width: frameWidth, height: frameHeight }]}>
-        <View style={[styles.corner, styles.topLeft, { borderColor }]} />
-        <View style={[styles.corner, styles.topRight, { borderColor }]} />
-        <View style={[styles.corner, styles.bottomLeft, { borderColor }]} />
-        <View style={[styles.corner, styles.bottomRight, { borderColor }]} />
-        <Animated.View style={[styles.scanLine, { backgroundColor: lineColor, opacity: locked ? 0 : 1, transform: [{ translateY }] }]} />
-      </View>
+      <Animated.View style={{ transform: [{ scale: lockPulse }] }}>
+        {isSmart && !locked && (
+          <Animated.View
+            style={[
+              styles.frameGlow,
+              { width: frameWidth, height: frameHeight, transform: [{ scale: glowScale }], opacity: glowOpacity },
+            ]}
+          />
+        )}
+        <View style={[styles.frame, { width: frameWidth, height: frameHeight }]}>
+          <View style={[styles.corner, styles.topLeft, { borderColor }]} />
+          <View style={[styles.corner, styles.topRight, { borderColor }]} />
+          <View style={[styles.corner, styles.bottomLeft, { borderColor }]} />
+          <View style={[styles.corner, styles.bottomRight, { borderColor }]} />
+          {isSmart && analyzing && !locked && (
+            <Animated.View style={[styles.analyzingRing, { transform: [{ rotate: spinRotate }] }]} />
+          )}
+          <Animated.View style={[styles.scanLine, { opacity: locked ? 0 : 1, transform: [{ translateY }] }]}>
+            <LinearGradient
+              colors={['transparent', lineColor, 'transparent']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 0 }}
+              style={StyleSheet.absoluteFill}
+            />
+          </Animated.View>
+          {locked && (
+            <View style={styles.lockCheckWrap}>
+              <Icon name="check" size={26} color="#ffffff" />
+            </View>
+          )}
+        </View>
+      </Animated.View>
     </View>
   );
 }
@@ -2298,6 +2465,10 @@ function describeRecognizedText(recognizedText, extra) {
 
   const linhas = [`Texto bruto lido pela câmera:\n"${raw}"`];
 
+  if (isLikelyNoiseText(raw)) {
+    linhas.push('⚠️ Esse texto foi identificado como RUÍDO (letras sem cara de palavra real) e a leitura foi anulada automaticamente — nenhum casamento com o catálogo foi tentado.');
+  }
+
   const sinais = [];
   if (gtin) sinais.push(`Código de barras encontrado no texto: ${gtin}`);
   if (ml !== null) sinais.push(`Volume identificado: ${formatVolume(ml)}`);
@@ -2333,6 +2504,20 @@ function ConfidenceBar({ score, dark = true }) {
   const labelColor = dark ? 'rgba(255,255,255,0.75)' : colors.mutedForeground;
   const valueColor = dark ? '#ffffff' : colors.foreground;
   const trackColor = dark ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.08)';
+
+  // Anima a barra deslizando suavemente até o novo valor em vez de "pular"
+  // de largura na hora — reforça a sensação de leitura acontecendo aos
+  // poucos (o sistema "formando confiança"), não um número que só troca.
+  const widthAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(widthAnim, {
+      toValue: percentText,
+      duration: 420,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [percentText, widthAnim]);
+
   return (
     <View>
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
@@ -2340,9 +2525,103 @@ function ConfidenceBar({ score, dark = true }) {
         <Text style={{ color: valueColor, fontSize: 11, fontFamily: 'Inter_700Bold' }}>{hasScore ? `${percentText}%` : '—'}</Text>
       </View>
       <View style={{ height: 8, borderRadius: 999, backgroundColor: trackColor, overflow: 'hidden' }}>
-        <View style={{ height: '100%', width: `${percentText}%`, borderRadius: 999, backgroundColor: barColor }} />
+        <Animated.View
+          style={{
+            height: '100%',
+            width: widthAnim.interpolate({ inputRange: [0, 100], outputRange: ['0%', '100%'] }),
+            borderRadius: 999,
+            backgroundColor: barColor,
+          }}
+        />
       </View>
     </View>
+  );
+}
+
+/**
+ * PAINEL DE LEITURA INTELIGENTE — substitui a pequena "pílula" de status por
+ * um painel centralizado, com cara de "sistema entendendo o que vê":
+ *   • ícone pulsando (respiração contínua; acelera e muda de cor enquanto
+ *     está de fato processando o casamento com o catálogo)
+ *   • status com transição suave (crossfade) toda vez que o texto muda, em
+ *     vez de trocar seco
+ *   • prévia AO VIVO do que a OCR está lendo naquele instante (pisca
+ *     suavemente a cada atualização), pra pessoa acompanhar em tempo real
+ *     — não só depois de travar num resultado
+ *   • barra de confiança (ConfidenceBar, já animada)
+ */
+function SmartReadingPanel({ status, liveText, score, boxesCount = 0 }) {
+  const isAnalyzing = status === 'analyzing';
+  const isDetecting = status === 'detecting';
+
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: isAnalyzing ? 550 : 1100, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: isAnalyzing ? 550 : 1100, easing: Easing.inOut(Easing.sin), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [isAnalyzing, pulse]);
+  const iconScale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.16] });
+  const iconOpacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] });
+  const iconColor = isAnalyzing ? '#06b6d4' : isDetecting ? colors.success : '#8b5cf6';
+
+  const statusText = isAnalyzing
+    ? 'Entendendo o que a câmera está lendo…'
+    : isDetecting
+      ? `${boxesCount} ${boxesCount === 1 ? 'texto detectado' : 'textos detectados'}`
+      : 'Aponte para o rótulo do produto';
+
+  // Crossfade: some e reaparece toda vez que o texto de status muda, em vez
+  // de trocar seco — dá a sensação de resposta "pensada", não instantânea.
+  const statusOpacity = useRef(new Animated.Value(1)).current;
+  const lastStatusRef = useRef(statusText);
+  useEffect(() => {
+    if (lastStatusRef.current === statusText) return;
+    lastStatusRef.current = statusText;
+    statusOpacity.setValue(0);
+    Animated.timing(statusOpacity, { toValue: 1, duration: 260, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+  }, [statusText, statusOpacity]);
+
+  // A prévia ao vivo "pisca" suavemente a cada nova leitura chegando — como
+  // um cursor de "estou capturando isso agora".
+  const liveOpacity = useRef(new Animated.Value(0)).current;
+  const lastLiveRef = useRef('');
+  useEffect(() => {
+    if (!liveText || lastLiveRef.current === liveText) return;
+    lastLiveRef.current = liveText;
+    liveOpacity.setValue(0.3);
+    Animated.timing(liveOpacity, { toValue: 1, duration: 320, easing: Easing.out(Easing.ease), useNativeDriver: true }).start();
+  }, [liveText, liveOpacity]);
+
+  return (
+    <BlurView intensity={36} tint="dark" style={styles.smartPanel}>
+      <View style={styles.smartPanelTopRow}>
+        <Animated.View
+          style={[
+            styles.smartPanelIconWrap,
+            { backgroundColor: `${iconColor}33`, transform: [{ scale: iconScale }], opacity: iconOpacity },
+          ]}
+        >
+          <Icon name="zap" size={16} color={iconColor} />
+        </Animated.View>
+        <Animated.Text style={[styles.smartPanelStatus, { opacity: statusOpacity }]} numberOfLines={1}>
+          {statusText}
+        </Animated.Text>
+      </View>
+
+      <Animated.View style={[styles.smartPanelLiveBox, { opacity: liveOpacity }]}>
+        <Text style={styles.smartPanelLiveLabel}>O QUE A CÂMERA ESTÁ LENDO</Text>
+        <Text style={styles.smartPanelLiveText} numberOfLines={2} ellipsizeMode="tail">
+          {liveText || 'Nenhum texto identificado ainda…'}
+        </Text>
+      </Animated.View>
+
+      <ConfidenceBar score={score} />
+    </BlurView>
   );
 }
 
@@ -2567,6 +2846,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   const [suggestion, setSuggestion] = useState(null);
   const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
   const [liveBoxes, setLiveBoxes] = useState({ boxes: [], frameWidth: 0, frameHeight: 0 });
+  const [liveRecognizedText, setLiveRecognizedText] = useState('');
   const [previewSize, setPreviewSize] = useState({ width: 0, height: 0 });
   const { modal: rawTextModal, show: showRawText } = useAppAlert();
   const lockedRef = useRef(false);
@@ -2598,6 +2878,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     setSuggestion(null);
     setLiveStatus(null);
     setLiveBoxes({ boxes: [], frameWidth: 0, frameHeight: 0 });
+    setLiveRecognizedText('');
     Haptics.selectionAsync().catch(() => {});
     AsyncStorage.setItem(SCAN_MODE_STORAGE_KEY, mode).catch(() => {});
   }, []);
@@ -2607,6 +2888,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     setLocked(false);
     setSuggestion(null);
     setLiveStatus(null);
+    setLiveRecognizedText('');
   }, []);
 
   const goToConfirm = useCallback((codigo, extra) => {
@@ -2650,6 +2932,12 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     // preço, casamento com o catálogo) ver texto quebrado em várias linhas.
     const trimmed = (text ?? '').replace(/\s+/g, ' ').trim();
     if (trimmed.length < OCR_MIN_TEXT_LENGTH) return;
+
+    // Atualiza a prévia AO VIVO no painel — mostra o que a câmera está
+    // pegando naquele instante, mesmo antes/sem disparar o casamento com o
+    // catálogo (que segue seu próprio throttle, mais espaçado, abaixo).
+    setLiveRecognizedText(trimmed);
+
     if (now - lastMatchAtRef.current < LIVE_MATCH_THROTTLE_MS) return;
     lastMatchAtRef.current = now;
 
@@ -2780,23 +3068,14 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   } else {
     mainContent = (
       <View style={[styles.overlay, styles.smartOverlay]}>
-        <ScanFrame locked={locked} mode="smart" />
+        <ScanFrame locked={locked} mode="smart" analyzing={!!liveStatus?.analyzing} />
 
-        <View style={[styles.hintPill, { flexDirection: 'column', alignItems: 'stretch', width: 240, gap: 6 }]}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
-            {liveBoxes.boxes.length > 0 && (
-              <View style={{ width: 7, height: 7, borderRadius: 999, backgroundColor: colors.success }} />
-            )}
-            <Text style={[styles.hint, { textAlign: 'center' }]}>
-              {liveStatus?.analyzing
-                ? 'Analisando…'
-                : liveBoxes.boxes.length > 0
-                ? `${liveBoxes.boxes.length} ${liveBoxes.boxes.length === 1 ? 'texto detectado' : 'textos detectados'}`
-                : 'Aponte para o rótulo do produto'}
-            </Text>
-          </View>
-          <ConfidenceBar score={liveStatus?.score} />
-        </View>
+        <SmartReadingPanel
+          status={liveStatus?.analyzing ? 'analyzing' : liveBoxes.boxes.length > 0 ? 'detecting' : 'idle'}
+          liveText={liveRecognizedText}
+          score={liveStatus?.score}
+          boxesCount={liveBoxes.boxes.length}
+        />
 
         <Pressable onPress={handleManualEntry} style={({ pressed }) => [styles.hintPill, { backgroundColor: 'rgba(0,0,0,0.3)', opacity: pressed ? 0.7 : 1 }]}>
           <Text style={styles.hint}>Não achou? Cadastrar manualmente</Text>
@@ -2862,11 +3141,15 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
 
             {suggestion.phase === 'notfound' ? (
               <>
-                <Text style={styles.suggestionTitle}>Não encontramos esse produto</Text>
+                <Text style={styles.suggestionTitle}>
+                  {suggestion.stage === 'ruido' ? 'Leitura sem palavras reconhecíveis' : 'Não encontramos esse produto'}
+                </Text>
                 <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
-                  {suggestion.recognizedText
-                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
-                    : 'Aponte de novo, bem de perto do nome do produto e com boa luz.'}
+                  {suggestion.stage === 'ruido'
+                    ? 'Isso não pareceu um nome de produto (parece ruído da câmera) — aponte de novo, bem de perto e com boa luz.'
+                    : suggestion.recognizedText
+                      ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                      : 'Aponte de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
                 {!!suggestion.recognizedText && (
                   <Pressable
@@ -2993,6 +3276,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   // ---- Modo Inteligente AO VIVO: estado do "placar" que fica atualizando -
   // enquanto a câmera embutida fica ligada, sem precisar tocar em nada. ----
   const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
+  const [liveRecognizedText, setLiveRecognizedText] = useState('');
   const { modal: rawTextModal, show: showRawText } = useAppAlert();
   const cameraRef = useRef(null);
   const smartLoopBusyRef = useRef(false);
@@ -3016,6 +3300,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     setSuggestion(null);
     setSmartPreviewUri(null);
     setLiveStatus(null);
+    setLiveRecognizedText('');
     Haptics.selectionAsync().catch(() => {});
     AsyncStorage.setItem(SCAN_MODE_STORAGE_KEY, mode).catch(() => {});
   }, []);
@@ -3026,6 +3311,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     setSuggestion(null);
     setSmartPreviewUri(null);
     setLiveStatus(null);
+    setLiveRecognizedText('');
   }, []);
 
   const goToConfirm = useCallback((codigo, extra) => {
@@ -3079,7 +3365,12 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
           stage: best.stage ?? null,
         });
       } else {
-        setSuggestion({ phase: 'notfound', recognizedText, precoDetectado: extractPriceFromText(recognizedText) });
+        setSuggestion({
+          phase: 'notfound',
+          recognizedText,
+          precoDetectado: extractPriceFromText(recognizedText),
+          stage: best.stage ?? null,
+        });
       }
     } catch {
       setSuggestion({ phase: 'notfound', recognizedText: '' });
@@ -3131,6 +3422,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
         setLiveStatus({ analyzing: false, score: null });
         return;
       }
+      setLiveRecognizedText(recognizedText);
 
       const best = await suggestProductByText(recognizedText);
       setLiveStatus({ analyzing: false, score: best.score ?? null });
@@ -3270,14 +3562,13 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     // barra de confiança e o texto de status.
     mainContent = (
       <View style={[styles.overlay, styles.smartOverlay]}>
-        <ScanFrame locked={locked} mode="smart" />
+        <ScanFrame locked={locked} mode="smart" analyzing={!!liveStatus?.analyzing} />
 
-        <View style={[styles.hintPill, { flexDirection: 'column', alignItems: 'stretch', width: 240, gap: 6 }]}>
-          <Text style={[styles.hint, { textAlign: 'center' }]}>
-            {liveStatus?.analyzing ? 'Analisando…' : 'Aponte para o rótulo do produto'}
-          </Text>
-          <ConfidenceBar score={liveStatus?.score} />
-        </View>
+        <SmartReadingPanel
+          status={liveStatus?.analyzing ? 'analyzing' : 'idle'}
+          liveText={liveRecognizedText}
+          score={liveStatus?.score}
+        />
 
         <View style={styles.smartButtonsRow}>
           <Pressable onPress={handleSmartGalleryPick} style={({ pressed }) => [styles.smartSecondaryButton, { opacity: pressed ? 0.75 : 1 }]}>
@@ -3348,11 +3639,15 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
               </View>
             ) : suggestion.phase === 'notfound' ? (
               <>
-                <Text style={styles.suggestionTitle}>Não encontramos esse produto</Text>
+                <Text style={styles.suggestionTitle}>
+                  {suggestion.stage === 'ruido' ? 'Leitura sem palavras reconhecíveis' : 'Não encontramos esse produto'}
+                </Text>
                 <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
-                  {suggestion.recognizedText
-                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
-                    : 'Tente tirar a foto de novo, bem de perto do nome do produto e com boa luz.'}
+                  {suggestion.stage === 'ruido'
+                    ? 'Isso não pareceu um nome de produto (parece ruído da câmera) — tente tirar a foto de novo, bem de perto e com boa luz.'
+                    : suggestion.recognizedText
+                      ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                      : 'Tente tirar a foto de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
                 {!!suggestion.recognizedText && (
                   <Pressable
@@ -4292,6 +4587,16 @@ const styles = StyleSheet.create({
   suggestionBackdrop: { position: 'absolute', left: 0, right: 0, bottom: 0, top: 0, alignItems: 'center', justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.55)', paddingHorizontal: 20, paddingBottom: 130, zIndex: 10 },
   suggestionCard: { width: '100%', borderRadius: 22, padding: 20, gap: 12, backgroundColor: colors.card },
   smartOverlay: { width: '100%', paddingHorizontal: 24, gap: 16 },
+  smartPanel: {
+    width: 280, borderRadius: 22, padding: 16, gap: 12, overflow: 'hidden',
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)', backgroundColor: 'rgba(11,20,41,0.35)',
+  },
+  smartPanelTopRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  smartPanelIconWrap: { width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center' },
+  smartPanelStatus: { flex: 1, color: '#ffffff', fontSize: 13, fontFamily: 'Inter_600SemiBold' },
+  smartPanelLiveBox: { gap: 3, paddingTop: 2 },
+  smartPanelLiveLabel: { color: 'rgba(255,255,255,0.5)', fontSize: 9, fontFamily: 'Inter_700Bold', letterSpacing: 0.6 },
+  smartPanelLiveText: { color: 'rgba(255,255,255,0.92)', fontSize: 13, fontFamily: 'Inter_500Medium', lineHeight: 18 },
   smartPreviewBox: { width: '100%', aspectRatio: 3 / 4, borderRadius: 24, overflow: 'hidden', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.16)' },
   smartPreviewImage: { width: '100%', height: '100%', resizeMode: 'cover' },
   smartPreviewPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 28, gap: 10 },
@@ -4315,15 +4620,24 @@ const styles = StyleSheet.create({
   suggestionSecondaryButton: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14, borderWidth: 1 },
   suggestionPrimaryButton: { alignItems: 'center', justifyContent: 'center', paddingVertical: 14, borderRadius: 14 },
   scanContainer: { alignItems: 'center', justifyContent: 'center', gap: 14 },
-  smartBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999 },
+  smartBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 999 },
   smartBadgeText: { color: '#ffffff', fontSize: 12, fontFamily: 'Inter_700Bold', letterSpacing: 0.2 },
   frame: { borderRadius: 20, overflow: 'hidden' },
+  frameGlow: { position: 'absolute', top: 0, left: 0, borderRadius: 28, backgroundColor: '#8b5cf6' },
+  analyzingRing: {
+    position: 'absolute', top: '50%', left: '50%', width: 56, height: 56, marginLeft: -28, marginTop: -28,
+    borderRadius: 28, borderWidth: 3, borderColor: 'rgba(255,255,255,0.15)', borderTopColor: '#06b6d4', borderRightColor: '#06b6d4',
+  },
+  lockCheckWrap: {
+    position: 'absolute', top: '50%', left: '50%', width: 52, height: 52, marginLeft: -26, marginTop: -26,
+    borderRadius: 26, backgroundColor: 'rgba(16,185,129,0.92)', alignItems: 'center', justifyContent: 'center',
+  },
   corner: { position: 'absolute', width: 32, height: 32, borderWidth: 4 },
   topLeft: { top: 0, left: 0, borderRightWidth: 0, borderBottomWidth: 0, borderTopLeftRadius: 20 },
   topRight: { top: 0, right: 0, borderLeftWidth: 0, borderBottomWidth: 0, borderTopRightRadius: 20 },
   bottomLeft: { bottom: 0, left: 0, borderRightWidth: 0, borderTopWidth: 0, borderBottomLeftRadius: 20 },
   bottomRight: { bottom: 0, right: 0, borderLeftWidth: 0, borderTopWidth: 0, borderBottomRightRadius: 20 },
-  scanLine: { position: 'absolute', left: 8, right: 8, top: 2, height: 3, borderRadius: 2 },
+  scanLine: { position: 'absolute', left: 8, right: 8, top: 2, height: 3, borderRadius: 2, overflow: 'hidden' },
   keypadGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
   key: { width: '30%', aspectRatio: 1.7, borderRadius: 16, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   keyLabel: { fontSize: 26, fontFamily: 'Inter_600SemiBold', color: colors.foreground },
