@@ -799,6 +799,78 @@ function computeUnitPricePerLiter(preco, ml) {
  * em gramas, ou outro número solto na foto). Devolve um número (5.87) ou
  * null se não achar nada com essa cara.
  */
+/* ------------------------------------------------------------------------ */
+/* IA DE PREÇO — corretor severo, tolerante a letra parecida com dígito      */
+/*                                                                            */
+/* Pedido específico: a OCR às vezes lê o preço trocando 1 dígito por uma    */
+/* LETRA parecida (ex.: lê "A1,02" quando a etiqueta diz "41,02" — o "4"      */
+/* saiu com cara de "A"). O extrator antigo exigia dígito de verdade         */
+/* (\d) em toda a extensão do número, então esses casos eram simplesmente    */
+/* PERDIDOS — o app não achava preço nenhum na etiqueta. Este corretor       */
+/* aceita, no lugar de cada dígito, tanto o dígito de verdade quanto uma     */
+/* letra com cara de dígito (mesma ideia do corretor de ML/KG que já existe  */
+/* mais abaixo, só que aplicada aqui ao preço) — e SÓ aceita o resultado se  */
+/* a forma reconstruída tiver mesmo cara de preço (vírgula/ponto + 2 casas), */
+/* nunca em qualquer número solto.                                          */
+/*                                                                            */
+/* Por que "A" entra aqui mas NÃO entra no corretor de palavra normal (ver   */
+/* OCR_DIGIT_LOOKALIKES mais abaixo, que deliberadamente NÃO inclui A/C/E/R  */
+/* por serem letras comuns demais em português): aqui o contexto é bem mais */
+/* estreito — só conta se o pedaço inteiro tiver o FORMATO de preço (dígitos */
+/* + vírgula/ponto + exatamente 2 casas decimais no fim), então o risco de   */
+/* atropelar uma palavra de verdade é muito menor do que seria no texto      */
+/* solto do nome do produto.                                                */
+/* ------------------------------------------------------------------------ */
+
+const PRICE_DIGIT_LOOKALIKES = {
+  O: '0', D: '0', Q: '0',
+  I: '1', L: '1',
+  Z: '2',
+  A: '4',
+  S: '5',
+  G: '6',
+  T: '7',
+  B: '8',
+};
+const PRICE_CHAR_CLASS = `0-9${Object.keys(PRICE_DIGIT_LOOKALIKES).join('')}`;
+
+/** Converte 1 caractere pro dígito real (dígito de verdade passa direto). */
+function priceCharToDigit(ch) {
+  if (/\d/.test(ch)) return ch;
+  return PRICE_DIGIT_LOOKALIKES[ch] ?? null;
+}
+
+/**
+ * Reconstrói um pedaço "com cara de preço" (dígitos reais + letras parecidas
+ * com dígito, mais vírgula/ponto) pro número de verdade — e conta quantas
+ * letras precisaram ser trocadas, pra medir o quão arriscada foi a leitura
+ * (usado logo abaixo pra decidir se confia sozinho ou não).
+ */
+function rebuildPriceChunk(chunk) {
+  let rebuilt = '';
+  let swapped = 0;
+  for (const ch of chunk) {
+    if (ch === ',' || ch === '.') {
+      rebuilt += ch;
+      continue;
+    }
+    const digit = priceCharToDigit(ch);
+    if (digit === null) return null; // nunca deveria acontecer (regex só captura char da classe), mas é trava extra de segurança
+    if (digit !== ch) swapped += 1;
+    rebuilt += digit;
+  }
+  return { value: rebuilt, swapped };
+}
+
+/**
+ * Acha um PREÇO no texto lido (OCR da etiqueta) — formato brasileiro "R$
+ * 5,87", "R$5,87" ou até só "5,87" perto de "R$" em outra linha. Etiqueta de
+ * supermercado quase sempre tem o preço no formato vírgula + 2 casas, então
+ * o regex exige exatamente isso (evita confundir com código de barras, peso
+ * em gramas, ou outro número solto na foto). Tolera 1 ou mais dígitos terem
+ * saído como letra parecida (ver bloco grande acima). Devolve um número
+ * (5.87) ou null se não achar nada com essa cara.
+ */
 function extractPriceFromText(text) {
   const upper = (text ?? '').toString().toUpperCase();
 
@@ -809,15 +881,41 @@ function extractPriceFromText(text) {
   // por causa desse erro de leitura.
 
   // Prioridade 1: "R$" bem coladinho no número — é o caso mais confiável,
-  // porque é literalmente assim que preço aparece impresso na etiqueta.
-  const withSymbol = upper.match(/R\$\s*(\d{1,4}(?:[.,]\d{3})*[.,]\d{2})\b/);
-  if (withSymbol) return parseBRLNumber(withSymbol[1]);
+  // porque é literalmente assim que preço aparece impresso na etiqueta. O
+  // "R$" já confirma o contexto, então aqui tolera QUALQUER quantidade de
+  // letra trocada por dígito parecido (inclusive várias de uma vez) — e
+  // ainda aceita até 2 caracteres de sujeira (espaço, ":", "-") entre o "R$"
+  // e o número, porque a OCR às vezes captura um risco ou dois-pontos
+  // fantasma bem ali.
+  const symbolPattern = new RegExp(
+    `R\\$\\s*[^0-9A-Z]{0,2}([${PRICE_CHAR_CLASS}]{1,4}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2})\\b`,
+  );
+  const withSymbol = upper.match(symbolPattern);
+  if (withSymbol) {
+    const rebuilt = rebuildPriceChunk(withSymbol[1]);
+    const parsed = rebuilt ? parseBRLNumber(rebuilt.value) : null;
+    if (parsed !== null) return parsed;
+  }
 
   // Prioridade 2 (mais arriscada): número solto no formato X,XX ou X.XX sem
   // o "R$" do lado — só usa se for o ÚNICO candidato nesse formato no texto
-  // todo, pra não arriscar pegar o número errado quando há mais de um.
-  const bareMatches = upper.match(/\b\d{1,4}(?:[.,]\d{3})*[.,]\d{2}\b/g);
-  if (bareMatches && bareMatches.length === 1) return parseBRLNumber(bareMatches[0]);
+  // todo, pra não arriscar pegar o número errado quando há mais de um. Sem
+  // o "R$" pra confirmar o contexto, só confia sozinho se no MÁXIMO 1 letra
+  // precisou ser trocada por dígito — 2 ou mais letras trocadas sem "R$" por
+  // perto é sinal forte demais de coincidência (não é preço de verdade) pra
+  // arriscar sem confirmação.
+  const barePattern = new RegExp(
+    `\\b[${PRICE_CHAR_CLASS}]{1,4}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2}\\b`,
+    'g',
+  );
+  const bareMatches = upper.match(barePattern);
+  if (bareMatches && bareMatches.length === 1) {
+    const rebuilt = rebuildPriceChunk(bareMatches[0]);
+    if (rebuilt && rebuilt.swapped <= 1) {
+      const parsed = parseBRLNumber(rebuilt.value);
+      if (parsed !== null) return parsed;
+    }
+  }
 
   return null;
 }
@@ -2688,6 +2786,95 @@ function hasRequiredScanFields(product, recognizedText) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* CAMADA INTELIGENTE EXTRA — "O QUE FALTOU": auditoria do próprio palpite    */
+/*                                                                            */
+/* Todas as camadas anteriores (direto, aprendizado, IA, web, sílaba, letras  */
+/* em comum) têm um único trabalho: ACHAR um produto. Esta camada faz o       */
+/* trabalho OPOSTO — depois que um produto já foi escolhido, ela audita essa  */
+/* escolha e aponta, em português direto, quais sinais de confirmação NÃO     */
+/* bateram ou simplesmente não foram encontrados (volume, preço, marca,       */
+/* variante, método usado). A diferença na prática: em vez do app só dizer    */
+/* "achei isso aqui" com uma % de confiança que ninguém sabe explicar, ele     */
+/* diz "achei isso, mas não consegui confirmar o preço nem a variante — dá     */
+/* uma conferida antes de enviar". Isso mostra ONDE prestar atenção, em vez    */
+/* de mandar reconferir a etiqueta inteira de novo. Nunca bloqueia nada       */
+/* sozinha (quem trava ou não continua sendo hasRequiredScanFields, acima) —   */
+/* aqui é só aviso pra pessoa decidir com mais informação.                    */
+/* ------------------------------------------------------------------------ */
+
+function analyzeMissingSignals(product, recognizedText, extra) {
+  if (!product) return ['Nenhum produto foi reconhecido com confiança suficiente.'];
+
+  const missing = [];
+  const raw = (recognizedText ?? '').trim();
+  const normalized = normalizeProductText(raw);
+  const nomeProdutoUpper = toSearchableUpper(product.produto ?? '');
+
+  // 1. VOLUME (ML) — mesmo sinal usado no casamento (ver penalidade de ML em
+  // productTextSimilarity): se a foto e o cadastro tiverem volumes
+  // DIFERENTES, é o indício mais forte que existe de produto trocado.
+  const mlNaFoto = extractMl(normalized);
+  const mlNoCadastro = product.ml ?? null;
+  if (mlNaFoto === null && (mlNoCadastro === null || mlNoCadastro === undefined)) {
+    missing.push('Não achei o volume (ML/L) nem na foto nem no cadastro do produto.');
+  } else if (
+    mlNaFoto !== null
+    && mlNoCadastro !== null
+    && mlNoCadastro !== undefined
+    && mlNaFoto !== mlNoCadastro
+  ) {
+    missing.push(
+      `O volume lido na foto (${formatVolume(mlNaFoto)}) é diferente do cadastrado (${formatVolume(mlNoCadastro)}) — confira se é o produto certo.`,
+    );
+  }
+
+  // 2. PREÇO — se não veio nem da foto nem do cadastro, a pessoa vai ter que
+  // digitar na mão de qualquer jeito — melhor avisar antes do que deixar ela
+  // descobrir só na hora de enviar.
+  const precoNaFoto = extractPriceFromText(raw);
+  if (precoNaFoto === null && (product.preco === null || product.preco === undefined)) {
+    missing.push('Não consegui ler o preço na etiqueta — vai precisar digitar na mão.');
+  }
+
+  // 3. MARCA — mesma checagem de hasRequiredScanFields, mas aqui é aviso
+  // explicativo, não bloqueio.
+  const allBrands = [
+    ...BRANDS.LEITE, ...BRANDS.CERVEJA, ...BRANDS.REFRIGERANTE, ...BRANDS.AGUA,
+  ];
+  const hasMarca = allBrands.some((brand) => nomeProdutoUpper.includes(brand.replace(/\s+/g, ' ')));
+  if (!hasMarca) {
+    missing.push('Não reconheci nenhuma marca conhecida no nome cadastrado desse produto.');
+  }
+
+  // 4. VARIANTE (ZERO/DIET/LIGHT/LATA/GARRAFA...) — se a foto e o cadastro
+  // discordam em qual variante é (foto tem "ZERO" mas o cadastro é o produto
+  // normal, ou o contrário), é risco concreto de confundir produtos irmãos
+  // da mesma prateleira.
+  const variantesNaFoto = extractVariantSet(normalized);
+  const variantesNoCadastro = extractVariantSet(nomeProdutoUpper);
+  const soNoCadastro = [...variantesNoCadastro].filter((v) => !variantesNaFoto.has(v));
+  const soNaFoto = [...variantesNaFoto].filter((v) => !variantesNoCadastro.has(v));
+  if (soNoCadastro.length > 0 || soNaFoto.length > 0) {
+    const detalhe = [
+      soNoCadastro.length > 0 ? `cadastro tem "${soNoCadastro.join(', ')}"` : null,
+      soNaFoto.length > 0 ? `foto tem "${soNaFoto.join(', ')}"` : null,
+    ]
+      .filter(Boolean)
+      .join(' e ');
+    missing.push(`A variante pode não bater (${detalhe}) — confira antes de confirmar.`);
+  }
+
+  // 5. MÉTODO USADO — se quem resolveu foi uma das camadas "fracas" (sílaba
+  // ou letras em comum), deixa claro que foi um palpite aproximado, não um
+  // casamento direto de nome/palavra.
+  if (extra?.stage === 'silaba' || extra?.stage === 'letras-parecidas') {
+    missing.push('O reconhecimento usou um método de última alternativa (aproximado) — vale conferir com atenção redobrada.');
+  }
+
+  return missing;
+}
+
+/* ------------------------------------------------------------------------ */
 /* IA DE RACIOCÍNIO — explica POR QUE escolheu o produto (Groq/Llama)        */
 /*                                                                            */
 /* Recebe o texto lido pela OCR, o produto escolhido e até 4 outros          */
@@ -3113,6 +3300,15 @@ function describeRecognizedText(recognizedText, extra) {
     linhas.push(`Confiança do casamento: ${Math.round(Math.max(0, Math.min(1, extra.score)) * 100)}%`);
   }
 
+  // CAMADA INTELIGENTE EXTRA — o que a auditoria acha que faltou (ver
+  // analyzeMissingSignals, mais abaixo, logo depois de hasRequiredScanFields).
+  if (extra?.productObj) {
+    const faltou = analyzeMissingSignals(extra.productObj, raw, extra);
+    if (faltou.length > 0) {
+      linhas.push(`⚠️ O que pode ter faltado:\n${faltou.map((m) => `• ${m}`).join('\n')}`);
+    }
+  }
+
   return linhas.join('\n\n');
 }
 
@@ -3473,6 +3669,10 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   const [locked, setLocked] = useState(false);
   const [scanMode, setScanMode] = useState('smart');
   const [suggestion, setSuggestion] = useState(null);
+  const missingSignals = useMemo(() => {
+    if (suggestion?.phase !== 'result') return [];
+    return analyzeMissingSignals(suggestion.productObj, suggestion.recognizedText, suggestion);
+  }, [suggestion]);
   const [liveStatus, setLiveStatus] = useState(null); // { analyzing: bool, score: number|null }
   const [liveBoxes, setLiveBoxes] = useState({ boxes: [], frameWidth: 0, frameHeight: 0 });
   const [liveRecognizedText, setLiveRecognizedText] = useState('');
@@ -3779,7 +3979,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                   {suggestion.stage === 'ruido'
                     ? 'Isso não pareceu um nome de produto (parece ruído da câmera) — aponte de novo, bem de perto e com boa luz.'
                     : suggestion.recognizedText
-                      ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                      ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60).toUpperCase()}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                       : 'Aponte de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
                 {!!suggestion.recognizedText && (
@@ -3811,7 +4011,7 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                 <Text style={styles.suggestionTitle}>Produto encontrado pelo texto lido</Text>
                 <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
                   {suggestion.recognizedText
-                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60).toUpperCase()}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
                 </Text>
                 {!!suggestion.recognizedText && (
@@ -3830,6 +4030,27 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                 {STAGE_LABELS[suggestion.stage] && (
                   <View style={[styles.suggestionTag, { alignSelf: 'flex-start', backgroundColor: colors.secondary }]}>
                     <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
+                  </View>
+                )}
+                {missingSignals.length > 0 && (
+                  <View
+                    style={{
+                      marginTop: 8,
+                      padding: 10,
+                      borderRadius: 10,
+                      backgroundColor: 'rgba(245,158,11,0.12)',
+                      borderWidth: 1,
+                      borderColor: 'rgba(245,158,11,0.35)',
+                      gap: 3,
+                    }}
+                  >
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Icon name="alert-triangle" size={13} color="#d97706" />
+                      <Text style={{ color: '#d97706', fontFamily: 'Inter_700Bold', fontSize: 12 }}>Confira antes de confirmar</Text>
+                    </View>
+                    {missingSignals.slice(0, 2).map((msg) => (
+                      <Text key={msg} style={{ color: colors.mutedForeground, fontSize: 12, lineHeight: 16 }}>• {msg}</Text>
+                    ))}
                   </View>
                 )}
                 <View style={{ marginTop: 8, marginBottom: 4 }}>
@@ -3907,6 +4128,10 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   const [locked, setLocked] = useState(false);
   const [scanMode, setScanMode] = useState('smart');
   const [suggestion, setSuggestion] = useState(null);
+  const missingSignals = useMemo(() => {
+    if (suggestion?.phase !== 'result') return [];
+    return analyzeMissingSignals(suggestion.productObj, suggestion.recognizedText, suggestion);
+  }, [suggestion]);
   const [ocrProcessing, setOcrProcessing] = useState(false);
   const [smartPreviewUri, setSmartPreviewUri] = useState(null);
   // ---- Modo Inteligente AO VIVO: estado do "placar" que fica atualizando -
@@ -4287,7 +4512,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                   {suggestion.stage === 'ruido'
                     ? 'Isso não pareceu um nome de produto (parece ruído da câmera) — tente tirar a foto de novo, bem de perto e com boa luz.'
                     : suggestion.recognizedText
-                      ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                      ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60).toUpperCase()}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                       : 'Tente tirar a foto de novo, bem de perto do nome do produto e com boa luz.'}
                 </Text>
                 {!!suggestion.recognizedText && (
@@ -4327,7 +4552,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                 <Text style={styles.suggestionTitle}>Produto encontrado pelo texto lido</Text>
                 <Text style={styles.suggestionSubtitle} numberOfLines={1} ellipsizeMode="tail">
                   {suggestion.recognizedText
-                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60)}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
+                    ? `Li na embalagem: "${suggestion.recognizedText.slice(0, 60).toUpperCase()}${suggestion.recognizedText.length > 60 ? '…' : ''}"`
                     : 'Este é o mais parecido no banco de dados:'}
                 </Text>
                 {!!suggestion.recognizedText && (
@@ -4346,6 +4571,27 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                 {STAGE_LABELS[suggestion.stage] && (
                   <View style={[styles.suggestionTag, { alignSelf: 'flex-start', backgroundColor: colors.secondary }]}>
                     <Text style={[styles.suggestionTagText, { color: colors.primary }]}>{STAGE_LABELS[suggestion.stage]}</Text>
+                  </View>
+                )}
+                {missingSignals.length > 0 && (
+                  <View
+                    style={{
+                      marginTop: 8,
+                      padding: 10,
+                      borderRadius: 10,
+                      backgroundColor: 'rgba(245,158,11,0.12)',
+                      borderWidth: 1,
+                      borderColor: 'rgba(245,158,11,0.35)',
+                      gap: 3,
+                    }}
+                  >
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Icon name="alert-triangle" size={13} color="#d97706" />
+                      <Text style={{ color: '#d97706', fontFamily: 'Inter_700Bold', fontSize: 12 }}>Confira antes de confirmar</Text>
+                    </View>
+                    {missingSignals.slice(0, 2).map((msg) => (
+                      <Text key={msg} style={{ color: colors.mutedForeground, fontSize: 12, lineHeight: 16 }}>• {msg}</Text>
+                    ))}
                   </View>
                 )}
                 <View style={{ marginTop: 8, marginBottom: 4 }}>
@@ -4651,9 +4897,10 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
                 <TextInput
                   style={styles.nameInput}
                   value={produto}
-                  onChangeText={setProduto}
+                  onChangeText={(value) => setProduto(value.toUpperCase())}
                   placeholder="Nome do produto"
                   placeholderTextColor={colors.mutedForeground}
+                  autoCapitalize="characters"
                   autoFocus
                   onBlur={() => setEditingName(false)}
                   returnKeyType="done"
