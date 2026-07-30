@@ -590,16 +590,44 @@ function rowToProduct(row) {
   };
 }
 
+// FATOR EXTRA DE CONFIABILIDADE — timeout em TODA chamada ao Baserow.
+//
+// Bug relatado: a busca "fica em loading" e não busca produto rápido. Causa
+// raiz: o `fetch` puro do JavaScript NÃO tem timeout nenhum por padrão — se
+// a rede engasgar (wifi fraco de loja, sinal caindo, servidor lento pra
+// responder mas sem fechar a conexão), a Promise do fetch fica pendurada
+// PRA SEMPRE, nunca resolve nem rejeita. Isso significa que o try/catch em
+// volta (em listAllProductsCached, findProductByCodigo etc.) NUNCA disparava
+// — o catch só protege contra erro, não contra "nunca responder". Resultado
+// na prática: a tela trava em "carregando" indefinidamente, e nenhuma das
+// outras camadas de reconhecimento (direto, sílaba, letras em comum...)
+// consegue rodar, porque todas dependem de listAllProductsCached esperando
+// essa mesma chamada travada.
+//
+// Correção: AbortController com prazo — mesma técnica já usada na chamada
+// do SerpApi (ver SERPAPI_TIMEOUT_MS mais abaixo). Depois desse prazo, o
+// fetch é cancelado à força e vira um erro de verdade, que os try/catch já
+// existentes sabem tratar (cai pro snapshot local, ou deixa a próxima
+// camada de reconhecimento assumir).
+const BASEROW_TIMEOUT_MS = 8000;
+
 async function baserowFetch(path, init) {
-  const res = await fetch(`${BASEROW_BASE_URL}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Token ${BASEROW_API_TOKEN}`,
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  });
-  return res;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), BASEROW_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BASEROW_BASE_URL}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Token ${BASEROW_API_TOKEN}`,
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+      signal: controller.signal,
+    });
+    return res;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 /** Busca uma linha pelo CODIGO (código de barras) exato. */
@@ -649,7 +677,14 @@ async function findProductByCodigo(codigo) {
 async function listAllProductsRaw() {
   const rows = [];
   let url = `/?${new URLSearchParams({ user_field_names: 'true', size: '200' }).toString()}`;
-  while (url) {
+  // Trava de segurança: nunca deveria passar de umas poucas centenas de
+  // páginas (200 produtos por página) — se acontecer, é sinal de paginação
+  // quebrada/em loop, e é melhor parar com o que já tem do que girar pra
+  // sempre travando a tela.
+  let safetyPages = 0;
+  const MAX_PAGES = 200;
+  while (url && safetyPages < MAX_PAGES) {
+    safetyPages += 1;
     const res = await baserowFetch(url);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
@@ -723,22 +758,39 @@ async function deleteProductRowRemote(id) {
 /* INTEGRAÇÃO REAL COM COSMOS (BLUESOFT)                                     */
 /* ------------------------------------------------------------------------ */
 
+// Mesmo problema do Baserow (ver BASEROW_TIMEOUT_MS, mais acima): fetch sem
+// timeout pode ficar pendurado pra sempre se a rede engasgar — e como é
+// chamado direto do useEffect da tela de confirmação (ver lookupProduct),
+// isso deixava a tela travada em "carregando" indefinidamente pra qualquer
+// código de barras novo (que precisa consultar o Cosmos, não achado ainda
+// no Baserow). Mesma correção: AbortController com prazo.
+const COSMOS_TIMEOUT_MS = 8000;
+
 /** Consulta um produto pelo GTIN/código de barras no catálogo Cosmos. */
 async function lookupCosmosProduct(gtin) {
-  const res = await fetch(`https://api.cosmos.bluesoft.com.br/gtins/${gtin}.json`, {
-    method: 'GET',
-    headers: {
-      'User-Agent': 'Cosmos-API-Request',
-      'Content-Type': 'application/json',
-      'X-Cosmos-Token': COSMOS_API_TOKEN,
-    },
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Cosmos lookup falhou (status ${res.status}) ${body}`);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), COSMOS_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://api.cosmos.bluesoft.com.br/gtins/${gtin}.json`, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Cosmos-API-Request',
+        'Content-Type': 'application/json',
+        'X-Cosmos-Token': COSMOS_API_TOKEN,
+      },
+      signal: controller.signal,
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) return null; // sem estoque na Cosmos, chave inválida, limite etc. — segue o fluxo como "não achado", não trava a tela
+    return await res.json();
+  } catch {
+    // timeout, sem internet, resposta malformada etc. — mesma ideia: não
+    // acha nada, mas NUNCA deixa a Promise pendurada nem propaga erro pra
+    // travar a tela de confirmação.
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return res.json();
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1596,19 +1648,77 @@ function invalidateTokenFrequencyCache() {
   _tokenFrequencyCache = null;
 }
 
+// FATOR EXTRA DE CONFIABILIDADE — cache "stale-while-revalidate".
+//
+// Bug relatado: além do fetch sem timeout (corrigido acima), havia uma
+// segunda causa pro "fica em loading": mesmo com o comentário aqui do lado
+// dizendo que a PRIMEIRA busca deveria ser instantânea (usando o snapshot
+// local embutido no app), a implementação antiga não fazia isso de verdade
+// — sempre que o cache estava "vencido" (a cada 30s, ou logo na primeira
+// chamada, já que fetchedAt começa em 0), a função dava `await` direto na
+// rede ANTES de devolver qualquer coisa. Ou seja: toda vez que o cache
+// vencia, TODAS as camadas de reconhecimento (direto, sílaba, letras em
+// comum...) ficavam paradas esperando o Baserow responder — e se a rede
+// estivesse ruim, essa espera podia demorar bastante (agora, no máximo,
+// os BASEROW_TIMEOUT_MS de cima, mas ainda assim trava a leitura por até
+// 8s a cada 30s de uso).
+//
+// Correção de verdade: SEMPRE devolve o que já está em cache NA HORA (nunca
+// espera rede), mesmo que esteja "vencido" — e dispara a atualização real
+// em SEGUNDO PLANO, sem bloquear ninguém. Assim o escaneamento nunca fica
+// esperando o Baserow responder; na pior das hipóteses, usa dados de até
+// 30s+ atrás (praticamente irrelevante pra catálogo de supermercado, que
+// não muda a cada segundo) enquanto a atualização acontece por trás.
+let productsRefreshInFlight = null; // evita disparar 2+ atualizações em paralelo
+
+function refreshProductsInBackground() {
+  if (productsRefreshInFlight) return productsRefreshInFlight; // já tem uma rodando — reaproveita
+  productsRefreshInFlight = listAllProductsRaw()
+    .then((rows) => {
+      productsCache = { rows, fetchedAt: Date.now(), fromSnapshot: false };
+      invalidateTokenFrequencyCacheIfCountChanged(rows.length);
+      return rows;
+    })
+    .catch(() => null) // falha silenciosa — quem já tem cache nem percebe, tenta de novo no próximo ciclo
+    .finally(() => {
+      productsRefreshInFlight = null;
+    });
+  return productsRefreshInFlight;
+}
+
+// A frequência de token (idf) é calculada por CONTAGEM de produto (ver
+// getTokenFrequency) — se o catálogo mudou de tamanho depois de um refresh
+// em segundo plano, força o recálculo pra não ficar com peso desatualizado.
+function invalidateTokenFrequencyCacheIfCountChanged(newCount) {
+  if (_tokenFrequencyCache && _tokenFrequencyCache.rowCount !== newCount) {
+    _tokenFrequencyCache = null;
+  }
+}
+
 async function listAllProductsCached() {
   const now = Date.now();
-  if (productsCache && now - productsCache.fetchedAt < PRODUCTS_CACHE_TTL_MS) {
+
+  // JÁ TEM CACHE (mesmo vencido)? Devolve NA HORA — nunca espera rede. Se
+  // estiver vencido, dispara atualização em segundo plano (sem "await" de
+  // propósito) pra da próxima vez já estar fresco, mas o escaneamento ATUAL
+  // não fica esperando por isso.
+  if (productsCache) {
+    if (now - productsCache.fetchedAt >= PRODUCTS_CACHE_TTL_MS) {
+      refreshProductsInBackground();
+    }
     return productsCache.rows;
   }
+
+  // Só cai aqui se productsCache nunca foi inicializado (não deveria
+  // acontecer, já que é inicializado com o snapshot local lá em cima — mas
+  // fica como rede de segurança). Com timeout (BASEROW_TIMEOUT_MS) pra
+  // nunca travar pra sempre; se falhar, cai pro snapshot local embutido.
   try {
     const rows = await listAllProductsRaw();
     productsCache = { rows, fetchedAt: now, fromSnapshot: false };
     return rows;
   } catch {
-    // Sem internet ou Baserow fora — retorna o snapshot local como fallback.
-    // Não zera o cache pra não ficar tentando a cada scan quando offline.
-    productsCache = { ...productsCache, fetchedAt: now - PRODUCTS_CACHE_TTL_MS + 5000 };
+    productsCache = { rows: LOCAL_PRODUCTS_SNAPSHOT, fetchedAt: now - PRODUCTS_CACHE_TTL_MS + 5000, fromSnapshot: true };
     return productsCache.rows;
   }
 }
@@ -1920,11 +2030,30 @@ function buildTokenDocumentFrequency(rows) {
 }
 
 /** idf suavizado: comum (df alto) → peso perto de baixo; raro (df baixo) → peso alto. */
+// FATOR EXTRA DE PRECISÃO — piso de peso pra palavra-variante (ZERO, DIET,
+// LIGHT, LATA, GARRAFA...).
+//
+// Bug relatado: o app confunde "COCA-COLA" com "COCA-COLA ZERO" (e casos
+// parecidos: leite integral vs desnatado, cerveja lata vs garrafa...).
+// Causa raiz: o peso por raridade (idf) julga "ZERO" pouco importante
+// porque ela aparece em MUITOS produtos do catálogo inteiro (refrigerante,
+// cerveja, achocolatado...) — mas isso é enganoso: pra DISTINGUIR dois
+// produtos IRMÃOS da mesma marca/prateleira (a versão normal e a versão
+// zero do MESMO refrigerante), "ZERO" é a ÚNICA palavra que importa. O idf
+// olha o catálogo inteiro, não o par específico de candidatos, e por isso
+// subestimava essa palavra bem na hora que ela mais importava.
+//
+// Correção: garante um piso de peso pras palavras-variante — mesmo se o
+// cálculo por raridade (idf) achar que ela é comum e desse pouco peso, o
+// score final ainda tem que sentir a presença/ausência dela com força.
+const VARIANT_TOKEN_WEIGHT_FLOOR = 2.8; // equivalente a uma palavra bem rara no catálogo
+
 function tokenWeight(token, tokenFrequency) {
   if (!tokenFrequency) return 1;
   const { df, totalProducts } = tokenFrequency;
   const occurrences = df.get(token) ?? 1;
-  return Math.log(1 + totalProducts / occurrences) + 0.3;
+  const base = Math.log(1 + totalProducts / occurrences) + 0.3;
+  return VARIANT_KEYWORDS.includes(token) ? Math.max(base, VARIANT_TOKEN_WEIGHT_FLOOR) : base;
 }
 
 // Quão parecidos dois "tokens" (palavras) precisam ser pra contar como "a
@@ -2090,11 +2219,21 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   // Penalidade por variante diferente (ZERO, LN, GARRAFA, etc): se um dos
   // textos claramente indica uma variante que o outro não tem, o produto
   // provavelmente é diferente mesmo com o nome parecido.
+  //
+  // Reforçado de 0.55 pra 0.4 (ver comentário grande em VARIANT_TOKEN_WEIGHT_
+  // FLOOR, mais acima) — testei o caso relatado (OCR não pegou a palavra
+  // "ZERO" na foto) e com 0.55 o score final ficava BEM na borda do piso de
+  // aceitação (0.4976 contra piso 0.5) — qualquer ruidozinho a mais na foto
+  // já fazia o app confundir o produto normal com o Zero. Com 0.4 (e
+  // escalando ainda mais forte se tiver MAIS de uma variante discordando de
+  // uma vez, ex.: "ZERO" E "LATA" diferentes ao mesmo tempo), sobra bem mais
+  // margem de segurança.
   const variantsA = extractVariantSet(upperA);
   const variantsB = extractVariantSet(upperB);
   const onlyInA = [...variantsA].filter((v) => !variantsB.has(v));
   const onlyInB = [...variantsB].filter((v) => !variantsA.has(v));
-  if (onlyInA.length > 0 || onlyInB.length > 0) score *= 0.55;
+  const variantMismatchCount = onlyInA.length + onlyInB.length;
+  if (variantMismatchCount > 0) score *= 0.4 ** Math.min(variantMismatchCount, 2);
 
   return Math.max(0, Math.min(1, score));
 }
@@ -2406,7 +2545,8 @@ function productSyllableSimilarity(rawA, rawB) {
   const variantsB = extractVariantSet(upperB);
   const onlyInA = [...variantsA].filter((v) => !variantsB.has(v));
   const onlyInB = [...variantsB].filter((v) => !variantsA.has(v));
-  if (onlyInA.length > 0 || onlyInB.length > 0) score *= 0.55;
+  const variantMismatchCount = onlyInA.length + onlyInB.length;
+  if (variantMismatchCount > 0) score *= 0.4 ** Math.min(variantMismatchCount, 2);
 
   return Math.max(0, Math.min(1, score));
 }
@@ -2512,6 +2652,16 @@ function rawLetterSimilarity(rawA, rawB) {
   const mlA = extractMl(normalizeProductText(rawA));
   const mlB = extractMl(normalizeProductText(rawB));
   if (mlA !== null && mlB !== null && mlA !== mlB) score *= 0.25;
+
+  // Mesma penalidade de variante (ZERO, DIET, LIGHT...) das outras camadas —
+  // até no método mais "bruto" de todos não pode confundir "COCA-COLA" com
+  // "COCA-COLA ZERO" só porque as letras batem.
+  const variantsA = extractVariantSet(normalizeProductText(rawA));
+  const variantsB = extractVariantSet(normalizeProductText(rawB));
+  const onlyInA = [...variantsA].filter((v) => !variantsB.has(v));
+  const onlyInB = [...variantsB].filter((v) => !variantsA.has(v));
+  const variantMismatchCount = onlyInA.length + onlyInB.length;
+  if (variantMismatchCount > 0) score *= 0.4 ** Math.min(variantMismatchCount, 2);
 
   return Math.max(0, Math.min(1, score));
 }
@@ -2654,6 +2804,30 @@ async function findLearnedMatch(recognizedText) {
 /* camada resolveu — útil pra mostrar na tela como o produto foi achado.     */
 /* ------------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------------ */
+/* FATOR EXTRA DE CONFIABILIDADE — isolamento de falha por camada            */
+/*                                                                            */
+/* Bug relatado: se UMA camada desse errado (uma chamada de rede que falha   */
+/* de um jeito inesperado, um texto malformado que quebra alguma conta), o   */
+/* erro subia sem tratamento e derrubava a função INTEIRA — nenhuma das      */
+/* camadas seguintes chegava a rodar, e o app "parava de funcionar" pra      */
+/* aquele scan, mesmo tendo vários outros métodos prontos pra tentar.        */
+/*                                                                            */
+/* `safeStage` isola cada tentativa: se a função passada der erro por        */
+/* qualquer motivo, devolve o valor de reserva (fallback) na hora, em vez de */
+/* deixar o erro subir e travar tudo o que viria depois. Isso garante que    */
+/* TODAS as camadas (código na foto, aprendizado, direto, IA, web, sílaba,   */
+/* letras em comum) sempre têm a chance de rodar, mesmo que uma anterior     */
+/* tenha falhado de um jeito que ninguém previu.                            */
+/* ------------------------------------------------------------------------ */
+async function safeStage(fn, fallback) {
+  try {
+    return await fn();
+  } catch {
+    return fallback;
+  }
+}
+
 async function enrichRecognizedText(recognizedText) {
   // FATOR EXTRA DE PRECISÃO — código de barras já vem impresso (em dígitos,
   // por baixo das barras) em boa parte das embalagens, e às vezes a OCR
@@ -2664,7 +2838,7 @@ async function enrichRecognizedText(recognizedText) {
   // e mais rápido (nem gasta IA/web se já achou por aqui).
   const gtinNaFoto = extractGtinFromText(recognizedText);
   if (gtinNaFoto) {
-    const byGtinNaFoto = await findProductByCodigo(gtinNaFoto);
+    const byGtinNaFoto = await safeStage(() => findProductByCodigo(gtinNaFoto), null);
     if (byGtinNaFoto) return { found: true, score: 1, product: byGtinNaFoto, stage: 'codigo-na-foto' };
   }
 
@@ -2673,7 +2847,7 @@ async function enrichRecognizedText(recognizedText) {
   // (e um humano já confirmou) um texto muito parecido com este antes, usa
   // direto — mais rápido, e não depende do Groq/SerpApi estarem no ar nem
   // terem cota sobrando.
-  const learned = await findLearnedMatch(recognizedText);
+  const learned = await safeStage(() => findLearnedMatch(recognizedText), null);
   if (learned) return { found: true, score: learned.score, product: learned.product, stage: 'aprendido' };
 
   // FATOR EXTRA DE PRECISÃO — anula de vez a leitura se ela for majoritariamente
@@ -2682,23 +2856,33 @@ async function enrichRecognizedText(recognizedText) {
   // barras encontrado (checado acima) e sem nenhuma palavra que pareça de
   // verdade, não vale a pena arriscar um casamento por acaso nem gastar
   // IA/busca web à toa — melhor já devolver "não achei" na hora.
-  if (isLikelyNoiseText(recognizedText)) {
+  const isNoise = await safeStage(async () => isLikelyNoiseText(recognizedText), false);
+  if (isNoise) {
     return { found: false, score: null, product: null, stage: 'ruido' };
   }
 
-  const direct = await findBestMatchByProductText(recognizedText);
+  const direct = await safeStage(
+    () => findBestMatchByProductText(recognizedText),
+    { found: false, score: null, product: null },
+  );
   if (direct.found && direct.score >= 0.65) {
     return { ...direct, stage: 'direto' };
   }
 
-  const [aiGuess, webResult] = await Promise.all([
-    correctOcrTextWithAI(recognizedText),
-    searchProductOnWeb(recognizedText),
-  ]);
+  // IA corretora (Groq) e busca web (SerpApi) já devolvem null internamente
+  // em caso de falha (ver correctOcrTextWithAI/searchProductOnWeb) — mas o
+  // Promise.all em si ainda é protegido aqui, como camada extra de segurança:
+  // se qualquer coisa inesperada acontecer nessa dupla chamada, as outras
+  // camadas (candidatos diretos, sílaba, letras em comum) continuam rodando
+  // do mesmo jeito, só sem o reforço de IA/web dessa vez.
+  const [aiGuess, webResult] = await safeStage(
+    () => Promise.all([correctOcrTextWithAI(recognizedText), searchProductOnWeb(recognizedText)]),
+    [null, null],
+  );
 
   // Sinal mais forte: a web trouxe um código de barras de verdade na página.
   if (webResult?.gtin) {
-    const byCodigo = await findProductByCodigo(webResult.gtin);
+    const byCodigo = await safeStage(() => findProductByCodigo(webResult.gtin), null);
     if (byCodigo) return { found: true, score: 1, product: byCodigo, stage: 'ean-web' };
   }
 
@@ -2712,7 +2896,13 @@ async function enrichRecognizedText(recognizedText) {
   let best = direct.found ? direct : { found: false, score: direct.score, product: null };
   let bestStage = 'direto';
   for (const candidate of candidates) {
-    const attempt = await findBestMatchByProductText(candidate.text);
+    // Cada candidato é testado isoladamente — se UM deles der erro (texto
+    // estranho vindo da web, por exemplo), só aquele candidato é descartado;
+    // os outros continuam sendo testados normalmente.
+    const attempt = await safeStage(
+      () => findBestMatchByProductText(candidate.text),
+      { found: false, score: null, product: null },
+    );
     if (attempt.found && (!best.found || attempt.score > best.score)) {
       best = attempt;
       bestStage = candidate.stage;
@@ -2724,7 +2914,10 @@ async function enrichRecognizedText(recognizedText) {
   const syllableCandidates = [recognizedText, aiGuess].filter(Boolean);
   let bestSyllable = { found: false, score: null, product: null };
   for (const text of syllableCandidates) {
-    const attempt = await findBestMatchBySyllable(text);
+    const attempt = await safeStage(
+      () => findBestMatchBySyllable(text),
+      { found: false, score: null, product: null },
+    );
     if (attempt.found && (!bestSyllable.found || attempt.score > bestSyllable.score)) {
       bestSyllable = attempt;
     }
@@ -2739,7 +2932,10 @@ async function enrichRecognizedText(recognizedText) {
   const rawLetterCandidates = [recognizedText, aiGuess].filter(Boolean);
   let bestRawLetters = { found: false, score: null, product: null };
   for (const text of rawLetterCandidates) {
-    const attempt = await findBestMatchByRawLetters(text);
+    const attempt = await safeStage(
+      () => findBestMatchByRawLetters(text),
+      { found: false, score: null, product: null },
+    );
     if (attempt.found && (!bestRawLetters.found || attempt.score > bestRawLetters.score)) {
       bestRawLetters = attempt;
     }
@@ -5345,19 +5541,32 @@ export default function App() {
     // enrichRecognizedText tenta, em ordem: código na foto → memória local
     // de confirmações (aprendizado, sem internet) → casamento direto → IA
     // corretora de OCR + busca real na web (SerpApi) → casamento por
-    // sílaba → última alternativa por letras em comum. Só avança pra
-    // próxima camada se a anterior não achou nada com confiança.
-    const match = await enrichRecognizedText(recognizedText);
-    return {
-      found: match.found,
-      codigo: match.product?.codigo ?? null,
-      produto: match.product?.produto ?? null,
-      preco: match.product?.preco ?? null,
-      ml: match.product?.ml ?? null,
-      quantidade: match.product?.quantidade ?? null,
-      score: match.score,
-      stage: match.stage,
-    };
+    // sílaba → última alternativa por letras em comum. Cada camada é
+    // isolada (ver safeStage, dentro de enrichRecognizedText): se uma falhar
+    // por qualquer motivo, as outras continuam tentando normalmente.
+    //
+    // Rede de segurança FINAL: mesmo que algo escape de todo o isolamento
+    // interno (bug inesperado, e não só falha de rede), esse try/catch
+    // garante que a tela NUNCA fica travada esperando uma Promise que
+    // rejeitou — sempre devolve "não encontrado" e deixa o app seguir
+    // funcionando pro próximo scan.
+    try {
+      const match = await enrichRecognizedText(recognizedText);
+      return {
+        found: match.found,
+        codigo: match.product?.codigo ?? null,
+        produto: match.product?.produto ?? null,
+        preco: match.product?.preco ?? null,
+        ml: match.product?.ml ?? null,
+        quantidade: match.product?.quantidade ?? null,
+        score: match.score,
+        stage: match.stage,
+      };
+    } catch {
+      return {
+        found: false, codigo: null, produto: null, preco: null, ml: null, quantidade: null, score: null, stage: 'erro',
+      };
+    }
   }, []);
 
   const runClearAllPrices = useCallback(async (onProgress) => {
