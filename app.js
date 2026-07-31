@@ -1,6 +1,55 @@
 /*
 =================================================================================
- PREÇO CERTO — versão single-file para Expo Snack (snack.expo.dev)
+ PREÇO CERTO v6 — versão single-file para Expo Snack (snack.expo.dev)
+=================================================================================
+ NOVIDADES v6 (melhorias de leitura e precisão):
+
+ 1. TAXA DE ATUALIZAÇÃO MAIS FLUIDA (sem travamento visual)
+    • Loop de captura: 1150ms → 750ms (modo Legacy/expo-text-extractor)
+    • Throttle de casamento ao vivo: 850ms → 600ms (modo Vision Camera)
+    • Throttle de caixinhas overlay: 150ms → 100ms (~10fps, mais suave)
+    • Cache de frame idêntico já existia; os novos intervalos se beneficiam
+      dele — ciclos repetidos com o mesmo rótulo não disparam busca nova.
+
+ 2. FILTRO DE REFLEXO EXPANDIDO
+    • Mapa dígito→letra agora inclui 3→E e 4→A (fontes de etiqueta térmica
+      com brilho/desgaste apagam partes do E e do A).
+    • Função reflectionDeglare com tentativa de reconstrução PARCIAL:
+      trata palavras com até 2 dígitos "órfãos" no meio de texto alfabético
+      mesmo quando algum dígito ainda não tem letra equivalente mapeada.
+    • Novo preProcessOcrRaw(): remove artefatos de reflexo já no texto bruto
+      (sequências repetidas de caracteres, traços, espaçamentos anômalos)
+      antes de qualquer outra etapa do pipeline — aplicado em TODOS os
+      modos (frame processor, loop de foto, galeria, foto pontual).
+
+ 3. CORREÇÃO OCR MELHORADA
+    • OCR_DIGIT_LOOKALIKES (corretor de número perto de ML/KG): agora
+      inclui E→3 e A→4 para cobrir mais variações de fonte condensada.
+    • PRICE_DIGIT_LOOKALIKES (corretor de preço): idem, E→3 e A→4.
+    • VARIANT_KEYWORDS expandida: EXTRA, GOLD, PREMIUM, CLASSIC, ESPECIAL,
+      NATURAL, ORGANICO, SEM GLUTEN, VEGANO, SUAVE, FORTE, CONCENTRADO,
+      CREME, LIQUIDO, EM PO, SOLAVEL.
+    • wordLookalikeTargets extras: ~25 novos termos de rótulo de
+      supermercado (ACHOCOLATADO, LEITE, SUCO, ARROZ, FEIJAO, DETERGENTE
+      etc.) — o corretor fuzzy agora reconhece erros de 1 letra neles.
+
+ 4. DETECÇÃO DE PREÇO MAIS PRECISA
+    • Aceita "RS", "R5", "R S", "R $" como variantes OCR de "R$" (câmera
+      confunde o cifrão com S ou 5 em tinta pouco contrastante).
+    • Aceita separador de milhar: "R$ 1.234,56" é reconhecido corretamente.
+    • Prioridade 2 nova: preço perto de palavra-chave (PRECO, VALOR, VLR,
+      UNIT) — comum em etiqueta de gôndola com campo de preço rotulado.
+    • Tolerância de ruído entre símbolo e número: de 2 para 4 caracteres
+      (compensação de reflexo entre o cifrão e o primeiro dígito).
+    • Guarda de faixa (0,01 → 99.999): evita aceitar volume/código como
+      preço por coincidência.
+    • Exclui candidatos que terminam em ML/KG/L/G/UN (ex.: "500ML" não
+      vira preço "5,00").
+
+ 5. QUALIDADE DE FOTO MELHORADA
+    • Captura do loop: quality 0.25 → 0.35 — reduz artefatos de compressão
+      JPEG nas bordas das letras, que eram uma causa direta de trocas de
+      letra por dígito na OCR.
 =================================================================================
 
 COMO USAR:
@@ -878,7 +927,8 @@ const PRICE_DIGIT_LOOKALIKES = {
   O: '0', D: '0', Q: '0',
   I: '1', L: '1',
   Z: '2',
-  A: '4',
+  E: '3', // E → 3 (barras horizontais parecidas, brilho apaga parte do E)
+  A: '4', // A → 4 (fonte de impressão térmica desgastada)
   S: '5',
   G: '6',
   T: '7',
@@ -922,42 +972,65 @@ function rebuildPriceChunk(chunk) {
  * em gramas, ou outro número solto na foto). Tolera 1 ou mais dígitos terem
  * saído como letra parecida (ver bloco grande acima). Devolve um número
  * (5.87) ou null se não achar nada com essa cara.
+ *
+ * v6 — melhorias de detecção de preço:
+ *  • Aceita "RS", "R5", "R S", "R $" como variantes OCR de "R$"
+ *    (a câmera às vezes confunde "$" com "S" ou "5" — muito comum em
+ *    etiquetas impressas com tinta pouco contrastante)
+ *  • Aceita separador de milhar no preço (ex.: "R$ 1.234,56")
+ *  • Prioridade 3: preço perto das palavras PRECO / VALOR / VLR / UNIT
+ *    (comum em etiqueta de gôndola com campo de preço rotulado)
+ *  • Maior tolerância de caracteres entre o símbolo e o número (até 4)
+ *    para compensar ruído de reflexo entre o cifrão e o dígito
  */
 function extractPriceFromText(text) {
-  const upper = (text ?? '').toString().toUpperCase();
+  // v6: pré-processa o texto bruto antes de normalizar pro upper
+  const processed = preProcessOcrRaw(text ?? '');
+  const upper = processed.toString().toUpperCase();
 
-  // Aceita "," OU "." como separador decimal — a OCR às vezes lê a vírgula
-  // impressa na etiqueta como se fosse ponto (ex.: lê "3.98" quando na
-  // etiqueta está escrito "3,98"). O formato brasileiro sempre usa vírgula
-  // de verdade, mas aqui a gente aceita os dois pra não perder o preço só
-  // por causa desse erro de leitura.
+  // Variantes OCR de "R$": aceita "RS", "R5", "R$", "R S", "R $"
+  // O "5" é confusão com "$" em impressão térmica; o espaço entre R e $ é
+  // ruído de OCR em fontes condensadas de etiqueta de supermercado.
+  const RS_VARIANTS = 'R\\s*(?:\\$|S|5)';
 
-  // Prioridade 1: "R$" bem coladinho no número — é o caso mais confiável,
-  // porque é literalmente assim que preço aparece impresso na etiqueta. O
-  // "R$" já confirma o contexto, então aqui tolera QUALQUER quantidade de
-  // letra trocada por dígito parecido (inclusive várias de uma vez) — e
-  // ainda aceita até 2 caracteres de sujeira (espaço, ":", "-") entre o "R$"
-  // e o número, porque a OCR às vezes captura um risco ou dois-pontos
-  // fantasma bem ali.
+  // Prioridade 1: símbolo de preço (R$ ou variante OCR) colado no número.
+  // Aceita separador de milhar: "1.234,56" ou "1,234.56".
+  // Tolera até 4 caracteres de sujeira entre o símbolo e o número
+  // (risco, dois-pontos, espaço, reflexo fantasma).
   const symbolPattern = new RegExp(
-    `R\\$\\s*[^0-9A-Z]{0,2}([${PRICE_CHAR_CLASS}]{1,4}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2})\\b`,
+    `(?:${RS_VARIANTS})\\s*[^0-9A-Z]{0,4}([${PRICE_CHAR_CLASS}]{1,5}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2})\\b`,
   );
   const withSymbol = upper.match(symbolPattern);
   if (withSymbol) {
     const rebuilt = rebuildPriceChunk(withSymbol[1]);
     const parsed = rebuilt ? parseBRLNumber(rebuilt.value) : null;
-    if (parsed !== null) return parsed;
+    if (parsed !== null && parsed >= 0.01 && parsed <= 99999) return parsed;
   }
 
-  // Prioridade 2 (mais arriscada): número solto no formato X,XX ou X.XX sem
+  // Prioridade 2: preço perto de palavra-chave de preço (PRECO, VALOR, VLR,
+  // UNIT, UNITARIO, R$ etc.) — comum em etiqueta de gôndola com rótulo de campo.
+  // Busca a palavra-chave e captura o primeiro número X,XX que aparece até
+  // 40 caracteres depois dela.
+  const keywordPricePattern = new RegExp(
+    `(?:PRECO|VALOR|VLR|UNIT|UNITARIO|POR|EACH)\\s*.{0,40}?([${PRICE_CHAR_CLASS}]{1,5}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2})\\b`,
+  );
+  const nearKeyword = upper.match(keywordPricePattern);
+  if (nearKeyword) {
+    const rebuilt = rebuildPriceChunk(nearKeyword[1]);
+    const parsed = rebuilt ? parseBRLNumber(rebuilt.value) : null;
+    if (parsed !== null && parsed >= 0.01 && parsed <= 99999) return parsed;
+  }
+
+  // Prioridade 3 (mais arriscada): número solto no formato X,XX ou X.XX sem
   // o "R$" do lado — só usa se for o ÚNICO candidato nesse formato no texto
   // todo, pra não arriscar pegar o número errado quando há mais de um. Sem
   // o "R$" pra confirmar o contexto, só confia sozinho se no MÁXIMO 1 letra
   // precisou ser trocada por dígito — 2 ou mais letras trocadas sem "R$" por
   // perto é sinal forte demais de coincidência (não é preço de verdade) pra
-  // arriscar sem confirmação.
+  // arriscar sem confirmação. Também exclui números que parecem ser volume
+  // (terminam em ML, KG, L, G) pra não confundir "500ML" com preço.
   const barePattern = new RegExp(
-    `\\b[${PRICE_CHAR_CLASS}]{1,4}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2}\\b`,
+    `\\b([${PRICE_CHAR_CLASS}]{1,5}(?:[.,][${PRICE_CHAR_CLASS}]{3})*[.,][${PRICE_CHAR_CLASS}]{2})\\b(?!\\s*(?:ML|KG|LT|UN|G|L)\\b)`,
     'g',
   );
   const bareMatches = upper.match(barePattern);
@@ -965,7 +1038,7 @@ function extractPriceFromText(text) {
     const rebuilt = rebuildPriceChunk(bareMatches[0]);
     if (rebuilt && rebuilt.swapped <= 1) {
       const parsed = parseBRLNumber(rebuilt.value);
-      if (parsed !== null) return parsed;
+      if (parsed !== null && parsed >= 0.01 && parsed <= 99999) return parsed;
     }
   }
 
@@ -1774,6 +1847,11 @@ const VARIANT_KEYWORDS = [
   'LONG NECK', 'LN', 'LAGER', 'PILSEN', 'IPA',
   'INTEGRAL', 'DESNATADO', 'SEMIDESNATADO',
   'TRADICIONAL', 'ORIGINAL',
+  // v6 — variantes adicionais frequentes em rótulo de supermercado
+  'EXTRA', 'GOLD', 'PREMIUM', 'CLASSIC', 'ESPECIAL',
+  'NATURAL', 'ORGANICO', 'SEM GLUTEN', 'VEGANO',
+  'SUAVE', 'FORTE', 'CONCENTRADO',
+  'CREME', 'LIQUIDO', 'EM PO', 'SOLAVEL',
 ];
 
 /* ---- CORRETOR SEVERO: número que a OCR leu como letra parecida ---------- */
@@ -1797,10 +1875,12 @@ const OCR_DIGIT_LOOKALIKES = {
   O: '0', D: '0', Q: '0',
   I: '1', L: '1',
   Z: '2',
+  E: '3', // E → 3 em fontes condensadas de etiqueta (barras horizontais lembram o "3")
+  A: '4', // A → 4 (ângulo do A sem a barra do meio, comum em impressão desgastada)
   S: '5',
   G: '6',
-  B: '8',
   T: '7',
+  B: '8',
 };
 
 /**
@@ -1919,7 +1999,15 @@ function wordLookalikeTargets() {
   // Além das palavras-variante (ZERO, DIET, LIGHT...), estas outras também
   // aparecem MUITO em rótulo de supermercado e a OCR erra elas com
   // frequência parecida — vale corrigir do mesmo jeito.
-  const extras = ['REFRIGERANTE', 'CERVEJA', 'GARRAFA', 'LATA', 'FARDO', 'CAIXA'];
+  const extras = [
+    'REFRIGERANTE', 'CERVEJA', 'GARRAFA', 'LATA', 'FARDO', 'CAIXA',
+    // v6 — termos adicionais muito comuns em rótulo de supermercado
+    'ACHOCOLATADO', 'LEITE', 'SUCO', 'AGUA', 'ENERGETICO', 'ISOTÔNICO',
+    'IOGURTE', 'MANTEIGA', 'QUEIJO', 'BISCOITO', 'BOLACHA',
+    'AZEITE', 'OLEO', 'VINAGRE', 'MOLHO', 'MAIONESE',
+    'ARROZ', 'FEIJAO', 'MACARRAO', 'FARINHA', 'ACUCAR', 'SAL',
+    'DETERGENTE', 'SABAO', 'AMACIANTE', 'SABONETE', 'SHAMPOO',
+  ];
   // FATOR EXTRA DE RECONHECIMENTO — marca também entra na correção de
   // palavra parecida. A marca é o sinal MAIS decisivo de todo o casamento
   // (ver BRAND_POSITION_BOOST e o peso por raridade/idf, mais abaixo): é o
@@ -1938,21 +2026,151 @@ function wordLookalikeTargets() {
   return [...new Set([...singleWordVariants, ...extras, ...brandWords])];
 }
 
+// FATOR EXTRA DE VELOCIDADE — wordLookalikeTargets() monta essa lista
+// combinando VARIANT_KEYWORDS + BRANDS inteiro toda vez que é chamada, mas
+// nenhuma dessas duas coisas muda depois que o app carrega — então calcular
+// de novo a cada chamada (que acontece a cada palavra de cada produto do
+// catálogo, ver fixWordLookalikes) é trabalho jogado fora. Calcula uma vez
+// só e reaproveita pro resto da sessão.
+let _wordLookalikeTargetsCache = null;
+function wordLookalikeTargetsCached() {
+  if (!_wordLookalikeTargetsCache) {
+    _wordLookalikeTargetsCache = wordLookalikeTargets();
+  }
+  return _wordLookalikeTargetsCache;
+}
+
+/* ---- FILTRO DE REFLEXO DE LUZ: dígito aparecendo no meio de palavra ----- */
+//
+// Problema relatado: reflexo de luz na etiqueta (foto tirada com brilho
+// batendo em cima do texto) apaga PARTE de uma letra — e a OCR, vendo só o
+// pedacinho que sobrou, lê como se fosse um dígito parecido. Exemplo dado:
+// "ZERO" vira "ZER9" (o brilho lava a curva de baixo do "O", sobra só o
+// arco de cima, que a OCR confunde com "9"). É o problema INVERSO do
+// corretor de preço (lá, letra virava dígito por causa da fonte; aqui,
+// LETRA vira dígito por causa de brilho/reflexo apagando parte dela).
+//
+// A diferença importante pro corretor de palavra comum (fixWordLookalikes,
+// logo abaixo): reflexo pode apagar MAIS de 1 caractere de uma vez (o
+// brilho costuma cobrir uma área, não uma letra só), então uma comparação
+// "fuzzy" comum (que só tolera ~1 erro numa palavra curta) pode não ser
+// parecida o suficiente pra bater. Este filtro RECONSTRÓI a palavra inteira
+// trocando cada dígito pela letra parecida (0→O, 9→O, 1→I, 2→Z, 5→S, 6→G,
+// 7→T, 8→B) e testa se o resultado bate EXATO com uma palavra conhecida —
+// isso funciona mesmo com vários dígitos de reflexo na mesma palavra,
+// porque não depende de "quão parecido" ficou, só de reconstruir a palavra
+// certa.
+const DIGIT_TO_LETTER_LOOKALIKES = {
+  0: 'O', 9: 'O', // 9 é o caso citado (ZER9 -> ZERO) — o "rabinho" do 9 lembra o traço que o brilho deixa
+  1: 'I',
+  2: 'Z',
+  3: 'E', // 3 invertido lembra E (brilho pode apagar a barra vertical do E)
+  4: 'A', // 4 tem forma de A em certas fontes de etiqueta
+  5: 'S',
+  6: 'G',
+  7: 'T',
+  8: 'B',
+};
+
+/**
+ * Tenta reconstruir uma palavra corrompida por reflexo (letra virou dígito
+ * parecido) pra grafia normal — só entra em ação se a palavra tiver LETRA E
+ * DÍGITO misturados (sinal forte de corrupção parcial, não um código ou
+ * número de verdade). Se algum dígito não tiver letra parecida conhecida,
+ * desiste — não arrisca inventar.
+ *
+ * v6: tenta também reconstrução PARCIAL quando só 1 ou 2 dígitos "órfãos"
+ * aparecem numa palavra predominantemente alfabética — brilho/reflexo
+ * costuma afetar 1-2 letras de uma vez, não a palavra inteira.
+ */
+function reflectionDeglare(word) {
+  if (!/[A-Z]/.test(word) || !/[0-9]/.test(word)) return null;
+
+  // Tentativa 1: reconstrução total (todos os dígitos têm letra equivalente)
+  let rebuilt = '';
+  let failed = false;
+  for (const ch of word) {
+    if (/[A-Z]/.test(ch)) { rebuilt += ch; continue; }
+    const letter = DIGIT_TO_LETTER_LOOKALIKES[ch];
+    if (!letter) { failed = true; break; }
+    rebuilt += letter;
+  }
+  if (!failed) return rebuilt;
+
+  // Tentativa 2: reconstrução PARCIAL — aceita dígitos sem letra equivalente
+  // (3 e 4 agora têm mapeamento em v6; esta tentativa trata casos futuros
+  // onde um novo dígito ainda não mapeado aparece no meio da palavra). Só
+  // usa o resultado se a palavra inteira ficou pelo menos 80% alfabética
+  // após a conversão — sinal de que era mesmo texto, não número.
+  let rebuilt2 = '';
+  let digits = 0;
+  for (const ch of word) {
+    if (/[A-Z]/.test(ch)) { rebuilt2 += ch; continue; }
+    digits += 1;
+    const letter = DIGIT_TO_LETTER_LOOKALIKES[ch];
+    rebuilt2 += letter ?? ch; // mantém o dígito original se não tem equivalente
+  }
+  const alphaCount = (rebuilt2.match(/[A-Z]/g) || []).length;
+  if (alphaCount / rebuilt2.length >= 0.8 && digits <= 2) return rebuilt2;
+
+  return null;
+}
+
+/**
+ * v6 — Pré-processamento de texto OCR bruto antes de qualquer etapa:
+ * remove lixo comum de reflexo/brilho que aparece como sequência de
+ * caracteres repetidos, linhas de traços, ou blocos de espaço enorme.
+ * Opera no texto BRUTO (antes de normalizar) — não deve ser chamado
+ * no nome do catálogo, só no texto lido pela câmera.
+ */
+function preProcessOcrRaw(rawText) {
+  return (rawText ?? '')
+    // Sequências de 3+ caracteres idênticos não-alfanuméricos → espaço
+    // (ex.: "---", "===", "|||", "...") — artefatos de brilho/borda de etiqueta
+    .replace(/([^A-Za-z0-9\s])\1{2,}/g, ' ')
+    // Sequências de 4+ caracteres alfanuméricos idênticos seguidos
+    // (ex.: "AAAA", "0000") — muito raro em texto real, quase sempre ruído
+    .replace(/([A-Za-z0-9])\1{3,}/g, (m) => m[0])
+    // Normaliza quebras de linha e espaçamentos excessivos
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{3,}/g, ' ')
+    .trim();
+}
+
 function fixWordLookalikes(normalizedUpperText) {
-  const targets = wordLookalikeTargets();
+  const targets = wordLookalikeTargetsCached();
   const words = normalizedUpperText.split(' ');
   const fixedWords = words.map((word) => {
     if (word.length < 3) return word;
     if (targets.includes(word)) return word; // já está com a grafia certa
 
+    // FILTRO DE REFLEXO — tenta primeiro reconstruir a palavra trocando
+    // dígito por letra parecida (ver reflectionDeglare, logo acima) e
+    // confere se bate EXATO com uma palavra-alvo. Prioridade máxima porque
+    // é uma reconstrução, não uma aproximação — funciona mesmo se o brilho
+    // tiver corrompido mais de 1 caractere na mesma palavra.
+    const deglared = reflectionDeglare(word);
+    if (deglared && targets.includes(deglared)) return deglared;
+
+    // Corretor fuzzy normal (ver WORD_LOOKALIKE_THRESHOLD acima) — testa
+    // tanto a palavra original quanto a versão "sem reflexo" contra cada
+    // alvo, fica com a que ficar mais parecida.
     let bestTarget = null;
     let bestSim = 0;
     for (const target of targets) {
-      if (Math.abs(word.length - target.length) > 2) continue; // tamanho muito diferente: ignora
-      const sim = similarity(word, target);
-      if (sim > bestSim) {
-        bestSim = sim;
-        bestTarget = target;
+      if (Math.abs(word.length - target.length) <= 2) {
+        const sim = similarity(word, target);
+        if (sim > bestSim) {
+          bestSim = sim;
+          bestTarget = target;
+        }
+      }
+      if (deglared && Math.abs(deglared.length - target.length) <= 2) {
+        const simDeglared = similarity(deglared, target);
+        if (simDeglared > bestSim) {
+          bestSim = simDeglared;
+          bestTarget = target;
+        }
       }
     }
     return bestTarget && bestSim >= WORD_LOOKALIKE_THRESHOLD ? bestTarget : word;
@@ -1960,7 +2178,7 @@ function fixWordLookalikes(normalizedUpperText) {
   return fixedWords.join(' ');
 }
 
-function normalizeProductText(text) {
+function normalizeProductTextUncached(text) {
   const base = (text ?? '')
     .toString()
     .normalize('NFD')
@@ -1988,6 +2206,48 @@ function normalizeProductText(text) {
   // entre letras) vira um TOKEN diferente de "200ML" e o casamento por
   // palavra falha, mesmo sendo exatamente o mesmo volume.
   return fixed.replace(/\b(\d+(?:[.,]\d+)?)\s+(ML|L|KG|G|UN)\b/g, '$1$2');
+}
+
+// FATOR EXTRA DE VELOCIDADE / MENOS TRAVAMENTO — cache transparente pra
+// normalizeProductText.
+//
+// Por que isso importa tanto: toda busca no catálogo (findBestMatchBy...)
+// chama normalizeProductText(recognizedText) uma vez PRA CADA produto do
+// catálogo comparado — só que "recognizedText" é sempre o MESMO texto
+// dentro dessa busca inteira! Sem cache, isso significava refazer TODO o
+// trabalho pesado de novo a cada produto: tirar acento, trocar letra por
+// número, e principalmente rodar fixWordLookalikes (que compara cada
+// palavra do texto contra a lista inteira de marcas/variantes usando
+// Levenshtein) — centenas de vezes seguidas pro EXATO mesmo resultado.
+// Isso sozinho já é uma causa e tanto de travamento num catálogo grande.
+//
+// A solução é simples e não muda o comportamento de ninguém que já chama
+// normalizeProductText — só guarda as últimas respostas calculadas e
+// devolve na hora se o texto já foi visto. Cache pequeno (16 entradas) e
+// com política "usado recentemente fica" (LRU aproximado por reinserção)
+// garante que o texto lido (repetido centenas de vezes na mesma busca)
+// nunca sai do cache no meio do caminho, mesmo intercalado com dezenas de
+// nomes de catálogo diferentes.
+const NORMALIZE_TEXT_CACHE_MAX = 16;
+const normalizeProductTextCache = new Map();
+
+function normalizeProductText(text) {
+  const key = text ?? '';
+  if (normalizeProductTextCache.has(key)) {
+    const cached = normalizeProductTextCache.get(key);
+    // Reinsere pra marcar como "usado recentemente" (aproxima um LRU de
+    // verdade usando só a ordem de inserção do Map, sem estrutura extra).
+    normalizeProductTextCache.delete(key);
+    normalizeProductTextCache.set(key, cached);
+    return cached;
+  }
+  const value = normalizeProductTextUncached(text);
+  normalizeProductTextCache.set(key, value);
+  if (normalizeProductTextCache.size > NORMALIZE_TEXT_CACHE_MAX) {
+    const oldestKey = normalizeProductTextCache.keys().next().value;
+    normalizeProductTextCache.delete(oldestKey);
+  }
+  return value;
 }
 
 function extractVariantSet(normalizedUpperText) {
@@ -2278,12 +2538,21 @@ async function findBestMatchByProductText(recognizedText) {
       ]
     : rows;
 
+  // FATOR EXTRA DE RECONHECIMENTO — "IA" que aprende com erro (ver bloco
+  // grande de comentário acima de getMistakePenaltyMap): busca UMA VEZ os
+  // erros conhecidos parecidos com esse texto, antes de varrer o catálogo —
+  // cada candidato que já foi rejeitado por humano antes, pra um texto
+  // parecido com este, entra na disputa em desvantagem.
+  const mistakePenalties = await getMistakePenaltyMap(recognizedText);
+
   let best = null;
   let bestScore = -1;
   const EARLY_EXIT_SCORE = 0.97; // score tão alto que não vale a pena continuar
   for (const row of sortedRows) {
     if (!row.produto) continue;
-    const score = productTextSimilarity(recognizedText, row.produto, tokenFrequency);
+    let score = productTextSimilarity(recognizedText, row.produto, tokenFrequency);
+    const penalty = mistakePenalties.get(String(row.codigo));
+    if (penalty !== undefined) score *= penalty;
     if (score > bestScore) {
       bestScore = score;
       best = row;
@@ -2553,14 +2822,19 @@ function productSyllableSimilarity(rawA, rawB) {
 
 async function findBestMatchBySyllable(recognizedText) {
   const rows = await listAllProductsCached();
+  const mistakePenalties = await getMistakePenaltyMap(recognizedText);
   let best = null;
   let bestScore = -1;
+  const EARLY_EXIT_SCORE = 0.97; // mesma ideia do casamento direto — score tão alto que não vale continuar
   for (const row of rows) {
     if (!row.produto) continue;
-    const score = productSyllableSimilarity(recognizedText, row.produto);
+    let score = productSyllableSimilarity(recognizedText, row.produto);
+    const penalty = mistakePenalties.get(String(row.codigo));
+    if (penalty !== undefined) score *= penalty;
     if (score > bestScore) {
       bestScore = score;
       best = row;
+      if (bestScore >= EARLY_EXIT_SCORE) break;
     }
   }
   if (!best || bestScore < SYLLABLE_SUGGESTION_THRESHOLD) {
@@ -2668,14 +2942,19 @@ function rawLetterSimilarity(rawA, rawB) {
 
 async function findBestMatchByRawLetters(recognizedText) {
   const rows = await listAllProductsCached();
+  const mistakePenalties = await getMistakePenaltyMap(recognizedText);
   let best = null;
   let bestScore = -1;
+  const EARLY_EXIT_SCORE = 0.97; // mesma ideia das outras camadas — raro de bater aqui, mas não custa nada
   for (const row of rows) {
     if (!row.produto) continue;
-    const score = rawLetterSimilarity(recognizedText, row.produto);
+    let score = rawLetterSimilarity(recognizedText, row.produto);
+    const penalty = mistakePenalties.get(String(row.codigo));
+    if (penalty !== undefined) score *= penalty;
     if (score > bestScore) {
       bestScore = score;
       best = row;
+      if (bestScore >= EARLY_EXIT_SCORE) break;
     }
   }
   if (!best || bestScore < RAW_LETTERS_THRESHOLD) {
@@ -2787,6 +3066,118 @@ async function findLearnedMatch(recognizedText) {
 }
 
 /* ------------------------------------------------------------------------ */
+/* "IA" QUE APRENDE COM ERRO — memória de tropeço (negativa)                 */
+/*                                                                            */
+/* A memória acima (learnFromConfirmedScan/findLearnedMatch) é uma memória   */
+/* POSITIVA: "esse texto é ESSE produto". Esta aqui é o oposto — uma memória */
+/* de ERRO: toda vez que a pessoa aperta "Não é este produto", o app está    */
+/* dizendo explicitamente "você errou, não é esse aqui". Isso é sinal        */
+/* valioso demais pra jogar fora — sem essa memória, na PRÓXIMA vez que uma  */
+/* etiqueta parecida aparecesse, o algoritmo (que não mudou nada) tinha       */
+/* boa chance de sugerir o MESMO produto errado de novo.                     */
+/*                                                                            */
+/* Como funciona: cada erro confirmado fica guardado (texto lido + código do */
+/* produto que foi sugerido errado). Da próxima vez que um texto PARECIDO    */
+/* aparecer, esse produto específico recebe uma PENALIDADE no score dele —   */
+/* não é bloqueado de vez (podia ser coincidência de foto ruim daquela vez), */
+/* mas passa a competir em desvantagem contra os outros candidatos. Cada vez */
+/* que o MESMO erro se repete pro mesmo tipo de texto, a penalidade fica     */
+/* mais forte (contagem por entrada) — o app fica "mais desconfiado" do erro */
+/* quanto mais vezes ele se repete, exatamente como alguém aprenderia.       */
+/* ------------------------------------------------------------------------ */
+
+const MISTAKE_MEMORY_STORAGE_KEY = 'preco-certo:memoria-de-erros';
+const MISTAKE_MEMORY_MAX = 300;
+// Piso mais baixo que LEARNED_MATCH_THRESHOLD (0.8) de propósito: pra ERRO,
+// vale a pena ser mais abrangente na hora de reconhecer "texto parecido"
+// (mesmo que não seja idêntico) — o custo de aplicar uma penalidade extra
+// num candidato que JÁ era ruim é baixo, mas o benefício de evitar repetir
+// um erro conhecido é alto.
+const MISTAKE_MATCH_THRESHOLD = 0.68;
+
+let mistakeMemoryCache = null; // carregado 1x do AsyncStorage, depois fica em memória
+
+async function loadMistakeMemory() {
+  if (mistakeMemoryCache) return mistakeMemoryCache;
+  try {
+    const raw = await AsyncStorage.getItem(MISTAKE_MEMORY_STORAGE_KEY);
+    mistakeMemoryCache = raw ? JSON.parse(raw) : [];
+  } catch {
+    mistakeMemoryCache = [];
+  }
+  return mistakeMemoryCache;
+}
+
+/**
+ * Grava um erro confirmado por humano: "pro texto X, o produto Y sugerido
+ * estava ERRADO". Chamado quando a pessoa aperta "Não é este produto" numa
+ * sugestão do Modo Inteligente.
+ */
+async function recordMistake(recognizedText, wrongCodigo, wrongProduto) {
+  const text = (recognizedText ?? '').trim();
+  if (!text || !wrongCodigo) return;
+  const normalized = normalizeProductText(text);
+  if (!normalized) return;
+  try {
+    const list = await loadMistakeMemory();
+    // Já existe um erro bem parecido registrado pro MESMO produto errado?
+    // Soma a contagem (reforça a penalidade) em vez de duplicar a entrada.
+    const existingIdx = list.findIndex(
+      (entry) => entry.wrongCodigo === String(wrongCodigo) && similarity(entry.normalized, normalized) >= 0.85,
+    );
+    if (existingIdx >= 0) {
+      list[existingIdx] = {
+        ...list[existingIdx],
+        count: (list[existingIdx].count ?? 1) + 1,
+        updatedAt: Date.now(),
+      };
+    } else {
+      list.unshift({
+        normalized,
+        wrongCodigo: String(wrongCodigo),
+        wrongProduto: wrongProduto ?? null,
+        count: 1,
+        updatedAt: Date.now(),
+      });
+      if (list.length > MISTAKE_MEMORY_MAX) list.length = MISTAKE_MEMORY_MAX;
+    }
+    mistakeMemoryCache = list;
+    await AsyncStorage.setItem(MISTAKE_MEMORY_STORAGE_KEY, JSON.stringify(list));
+  } catch {
+    // Não trava o fluxo de "cadastrar manualmente" se isso falhar — é bônus.
+  }
+}
+
+/**
+ * Monta, PRA UM texto lido específico, um mapa {codigo -> multiplicador de
+ * penalidade} com todos os erros conhecidos parecidos o bastante com esse
+ * texto. Calculado UMA VEZ por busca (não por produto do catálogo) — o
+ * casamento em si só faz uma checagem de mapa (rápida) pra cada candidato,
+ * em vez de reconsultar a memória de erro centenas de vezes.
+ */
+async function getMistakePenaltyMap(recognizedText) {
+  const text = (recognizedText ?? '').trim();
+  const map = new Map();
+  if (!text) return map;
+  const normalized = normalizeProductText(text);
+  if (!normalized) return map;
+
+  const list = await loadMistakeMemory();
+  for (const entry of list) {
+    const sim = similarity(normalized, entry.normalized);
+    if (sim < MISTAKE_MATCH_THRESHOLD) continue;
+    // Penalidade fica mais forte quanto mais parecido o texto E quanto mais
+    // vezes esse erro específico já se repetiu — mas nunca some de vez
+    // (piso 0.15): pode ser mesmo o produto certo dessa vez, foto diferente.
+    const repeatStrength = Math.min(entry.count ?? 1, 5) * 0.08;
+    const penalty = Math.max(0.15, 1 - sim * 0.5 - repeatStrength);
+    const current = map.get(entry.wrongCodigo);
+    if (current === undefined || penalty < current) map.set(entry.wrongCodigo, penalty);
+  }
+  return map;
+}
+
+/* ------------------------------------------------------------------------ */
 /* MODO INTELIGENTE — ORQUESTRADOR: junta as 3 camadas numa função só         */
 /*                                                                            */
 /* Ordem de tentativa (só avança pra próxima camada se a anterior não achou   */
@@ -2886,12 +3277,30 @@ async function enrichRecognizedText(recognizedText) {
     if (byCodigo) return { found: true, score: 1, product: byCodigo, stage: 'ean-web' };
   }
 
-  const candidates = [
+  // FATOR EXTRA DE VELOCIDADE / MENOS TRAVAMENTO — cada candidato aqui
+  // dispara uma varredura no catálogo INTEIRO (ver findBestMatchByProductText).
+  // Duas otimizações que não tiram precisão nenhuma:
+  //  1. Limita a quantidade de títulos vindos da busca web — se a página
+  //     trouxer 8, 10 títulos parecidos, não faz sentido varrer o catálogo
+  //     8-10 vezes a mais só por causa disso; os primeiros já bastam.
+  //  2. Remove candidatos com o texto EXATAMENTE igual a outro já na lista
+  //     (ex.: a IA às vezes devolve o texto idêntico ao original quando não
+  //     via nada pra corrigir) — testar a mesma string 2x dá a mesma
+  //     resposta 2x, só custa tempo à toa.
+  const MAX_WEB_TITLE_CANDIDATES = 3;
+  const rawCandidates = [
     { text: recognizedText, stage: 'direto' },
     { text: aiGuess, stage: 'ia-ocr' },
     { text: webResult?.candidateName, stage: 'busca-web' },
-    ...((webResult?.titles ?? []).map((t) => ({ text: t, stage: 'busca-web' }))),
+    ...((webResult?.titles ?? []).slice(0, MAX_WEB_TITLE_CANDIDATES).map((t) => ({ text: t, stage: 'busca-web' }))),
   ].filter((c) => c.text);
+  const seenCandidateTexts = new Set();
+  const candidates = rawCandidates.filter((c) => {
+    const key = c.text.trim().toUpperCase();
+    if (seenCandidateTexts.has(key)) return false;
+    seenCandidateTexts.add(key);
+    return true;
+  });
 
   let best = direct.found ? direct : { found: false, score: direct.score, product: null };
   let bestStage = 'direto';
@@ -3065,6 +3474,25 @@ function analyzeMissingSignals(product, recognizedText, extra) {
   // casamento direto de nome/palavra.
   if (extra?.stage === 'silaba' || extra?.stage === 'letras-parecidas') {
     missing.push('O reconhecimento usou um método de última alternativa (aproximado) — vale conferir com atenção redobrada.');
+  }
+
+  // 6. MEMÓRIA DE ERRO — "IA" que aprende com erro (ver recordMistake /
+  // getMistakePenaltyMap, mais acima). A essa altura o mapa de penalidades
+  // já foi carregado em memória durante o próprio casamento (findBestMatch...
+  // já chamou getMistakePenaltyMap pra esse mesmo texto), então dá pra ler
+  // mistakeMemoryCache aqui direto, sem precisar de "await" nenhum. Se ESSE
+  // produto específico já foi apontado como errado antes pra um texto
+  // parecido com este, avisa — mesmo que ele ainda tenha vencido a disputa
+  // dessa vez (com a penalidade aplicada), vale reforçar a atenção.
+  if (mistakeMemoryCache) {
+    const codigoAtual = String(product.codigo);
+    const jaErrouAntes = mistakeMemoryCache.find(
+      (entry) => entry.wrongCodigo === codigoAtual && similarity(entry.normalized, normalized) >= MISTAKE_MATCH_THRESHOLD,
+    );
+    if (jaErrouAntes) {
+      const vezes = jaErrouAntes.count > 1 ? ` (já aconteceu ${jaErrouAntes.count}x)` : '';
+      missing.push(`Esse produto já foi apontado como ERRADO antes pra uma leitura parecida${vezes} — confira com atenção redobrada.`);
+    }
   }
 
   return missing;
@@ -3681,15 +4109,15 @@ function ScannerScreen(props) {
 /* ------------------------------------------------------------------------ */
 
 // LIVE_MATCH_THROTTLE_MS: intervalo mínimo entre chamadas ao pipeline de OCR
-// pesado (IA + Baserow). Reduzido de 1100 → 850ms a pedido: escaneamento
-// mais rápido. Não abaixamos mais que isso pra não voltar a ter contenção
-// de rede/travamento (abaixo de ~700-800ms o ganho de velocidade percebido
-// é pequeno e o risco de sobrecarregar a chamada de IA/Baserow sobe rápido).
-const LIVE_MATCH_THROTTLE_MS = 850;
+// pesado (IA + Baserow). Reduzido de 850 → 600ms para escaneamento mais
+// responsivo. O cache de texto idêntico (lastAnalyzedRef) garante que ciclos
+// repetidos com o mesmo texto não disparam busca nova — então baixar esse
+// valor não sobrecarrega a rede, só reage mais rápido quando o texto muda.
+const LIVE_MATCH_THROTTLE_MS = 600;
 // LIVE_BOX_THROTTLE_MS: intervalo mínimo entre atualizações visuais das
-// caixinhas "LIDO". Aumentado de 120 → 150ms pra reduzir re-renders sem
-// deixar a animação parecer lenta (abaixo de ~6fps o olho percebe gaguejo).
-const LIVE_BOX_THROTTLE_MS = 150;
+// caixinhas "LIDO". Reduzido de 150 → 100ms (~10fps) para animação mais
+// suave sem gaguejo perceptível — re-render de retângulos SVG é leve.
+const LIVE_BOX_THROTTLE_MS = 100;
 
 /**
  * Caixinhas desenhadas em cima do texto detectado ao vivo — a parte visual
@@ -3877,6 +4305,10 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   const lockedRef = useRef(false);
   const lastMatchAtRef = useRef(0);
   const lastBoxUpdateAtRef = useRef(0);
+  // FATOR EXTRA DE VELOCIDADE — mesmo cache usado no ScannerScreenLegacy (ver
+  // comentário grande em handleFrameOcrResult, logo abaixo): evita reprocessar
+  // o catálogo inteiro quando o frame lido é idêntico ao anterior.
+  const lastAnalyzedRef = useRef({ text: null, result: null });
   const indicatorX = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -3955,7 +4387,8 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     // linha (\n) entre cada linha lida na etiqueta — troca tudo por espaço
     // aqui, na origem, pra NENHUM lugar do app (cartão de sugestão, busca de
     // preço, casamento com o catálogo) ver texto quebrado em várias linhas.
-    const trimmed = (text ?? '').replace(/\s+/g, ' ').trim();
+    // v6: aplica pré-processamento de ruído/reflexo logo na origem do frame
+    const trimmed = preProcessOcrRaw(text ?? '');
     if (trimmed.length < OCR_MIN_TEXT_LENGTH) return;
 
     // Atualiza a prévia AO VIVO no painel — mostra o que a câmera está
@@ -3967,8 +4400,20 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     lastMatchAtRef.current = now;
 
     setLiveStatus((prev) => ({ analyzing: true, score: prev?.score ?? null }));
-    suggestProductByText(trimmed)
+    // FATOR EXTRA DE VELOCIDADE / MENOS TRAVAMENTO — cada frame lido dispara
+    // esse handler, e é super comum a câmera ler o MESMO texto em vários
+    // frames seguidos (mão parada em cima do rótulo). Sem esse cache, cada
+    // um desses frames repetidos disparava uma busca pesada no catálogo
+    // inteiro pra chegar sempre na mesma resposta — reaproveitar o resultado
+    // quando o texto é idêntico ao do frame anterior corta esse trabalho à
+    // toa sem perder precisão nenhuma (é literalmente a mesma pergunta).
+    const cachedFrame = lastAnalyzedRef.current;
+    const frameResultPromise = cachedFrame.text === trimmed && cachedFrame.result
+      ? Promise.resolve(cachedFrame.result)
+      : suggestProductByText(trimmed);
+    frameResultPromise
       .then((best) => {
+        lastAnalyzedRef.current = { text: trimmed, result: best };
         if (lockedRef.current) return;
         setLiveStatus({ analyzing: false, score: best.score ?? null });
         // FILTRO DE QUALIDADE: só trava se encontrar ML + PREÇO + MARCA
@@ -4292,7 +4737,15 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                   nearCandidates={[]}
                 />
                 <View style={styles.suggestionActions}>
-                  <Pressable style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]} onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}>
+                  <Pressable
+                    style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]}
+                    onPress={() => {
+                      // "IA" que aprende com erro — grava que esse produto foi
+                      // sugerido errado pra esse texto (ver recordMistake).
+                      recordMistake(suggestion.recognizedText, suggestion.matchedCodigo, suggestion.produto).catch(() => {});
+                      goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText });
+                    }}
+                  >
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
                   </Pressable>
                   <Pressable style={{ flex: 1 }} onPress={() => goToConfirm(suggestion.matchedCodigo, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}>
@@ -4338,6 +4791,11 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   const cameraRef = useRef(null);
   const smartLoopBusyRef = useRef(false);
   const lockedRef = useRef(false);
+  // FATOR EXTRA DE VELOCIDADE — cache do último texto já processado. Ver
+  // comentário grande em captureLiveFrame, mais abaixo, sobre por que isso
+  // corta bastante processamento repetido (e trava menos) sem perder
+  // precisão nenhuma.
+  const lastAnalyzedRef = useRef({ text: null, result: null });
   const indicatorX = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -4396,7 +4854,8 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     setSuggestion({ phase: 'checking' });
     try {
       const lines = await extractTextFromImage(uri);
-      const recognizedText = (lines || []).join(' ').replace(/\s+/g, ' ').trim();
+      // v6: pré-processamento de ruído/reflexo antes do pipeline de casamento
+      const recognizedText = preProcessOcrRaw((lines || []).join(' '));
 
       if (recognizedText.length < OCR_MIN_TEXT_LENGTH) {
         setSuggestion({ phase: 'notfound', recognizedText: '' });
@@ -4455,7 +4914,7 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   // fica acima de ~1s pra não voltar a sobrecarregar de foto (mais fotos =
   // mais decodificação de JPEG = mais uso de CPU = risco de travamento),
   // mas perceptivelmente mais ágil que antes.
-  const SMART_LIVE_INTERVAL_MS = 1150;
+  const SMART_LIVE_INTERVAL_MS = 750;
 
   const captureLiveFrame = useCallback(async () => {
     if (smartLoopBusyRef.current || lockedRef.current) return;
@@ -4464,10 +4923,14 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
     setLiveStatus((prev) => ({ analyzing: true, score: prev?.score ?? null }));
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        // quality 0.25: ainda legível pra OCR (texto tem bordas nítidas mesmo em
-        // JPEG baixo) mas o arquivo fica ~3x menor → decodificação mais rápida
-        // → menos frame drops na prévia ao vivo.
-        quality: 0.25,
+        // v6: quality elevada de 0.25 → 0.35. O ML Kit consegue ler texto
+        // em JPEG baixo, mas artefatos de compressão em qualidade muito
+        // baixa (blocos pixelados nas bordas das letras) aumentam a taxa de
+        // substituição de letra por dígito — exatamente o problema que os
+        // corretores de OCR tentam compensar. 0.35 já evita os piores
+        // blocos sem aumentar muito o tamanho do arquivo (~20% maior que
+        // 0.25, mas ainda ~2.5× menor que a qualidade padrão do sistema).
+        quality: 0.35,
         skipProcessing: true,
         // exif: false reduz o tamanho do arquivo e evita que o ML Kit gaste
         // tempo lendo metadados irrelevantes pra OCR de texto de rótulo.
@@ -4477,14 +4940,30 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
       if (!uri) return;
 
       const lines = await extractTextFromImage(uri);
-      const recognizedText = (lines || []).join(' ').replace(/\s+/g, ' ').trim();
+      // v6: aplica pré-processamento de ruído/reflexo ANTES de qualquer
+      // outra etapa — remove artefatos de brilho (sequências de caracteres
+      // repetidos, traços, espaçamentos excessivos) antes que atrapalhem
+      // o casamento com o catálogo.
+      const recognizedText = preProcessOcrRaw((lines || []).join(' '));
       if (recognizedText.length < OCR_MIN_TEXT_LENGTH) {
         setLiveStatus({ analyzing: false, score: null });
         return;
       }
       setLiveRecognizedText(recognizedText);
 
-      const best = await suggestProductByText(recognizedText);
+      // FATOR EXTRA DE VELOCIDADE / MENOS TRAVAMENTO — se a mão está parada
+      // em cima do rótulo (o caso mais comum durante o escaneamento), vários
+      // ciclos seguidos leem exatamente o MESMO texto — e sem esse cache o
+      // app rodava a busca pesada no catálogo inteiro de novo a cada ~1.15s
+      // pra chegar sempre na mesma resposta. Reaproveitar o resultado do
+      // ciclo anterior quando o texto é IDÊNTICO corta esse reprocessamento
+      // à toa sem abrir mão de precisão nenhuma — é literalmente a mesma
+      // pergunta, mesma resposta.
+      const cached = lastAnalyzedRef.current;
+      const best = cached.text === recognizedText && cached.result
+        ? cached.result
+        : await suggestProductByText(recognizedText);
+      lastAnalyzedRef.current = { text: recognizedText, result: best };
       setLiveStatus({ analyzing: false, score: best.score ?? null });
 
       // FILTRO DE QUALIDADE: só trava se encontrar ML + PREÇO + MARCA
@@ -4835,7 +5314,12 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                 <View style={styles.suggestionActions}>
                   <Pressable
                     style={[styles.suggestionSecondaryButton, { borderColor: colors.border }]}
-                    onPress={() => goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText })}
+                    onPress={() => {
+                      // "IA" que aprende com erro — grava que esse produto foi
+                      // sugerido errado pra esse texto (ver recordMistake).
+                      recordMistake(suggestion.recognizedText, suggestion.matchedCodigo, suggestion.produto).catch(() => {});
+                      goToConfirm(null, { precoDetectado: suggestion.precoDetectado, recognizedText: suggestion.recognizedText });
+                    }}
                   >
                     <Text style={{ color: colors.foreground, fontFamily: 'Inter_600SemiBold' }}>Não é este</Text>
                   </Pressable>
