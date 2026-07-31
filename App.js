@@ -4118,6 +4118,12 @@ const LIVE_MATCH_THROTTLE_MS = 600;
 // caixinhas "LIDO". Reduzido de 150 → 100ms (~10fps) para animação mais
 // suave sem gaguejo perceptível — re-render de retângulos SVG é leve.
 const LIVE_BOX_THROTTLE_MS = 100;
+// OCR_TARGET_FPS — CORREÇÃO (v7): antes o scanOCR (ML Kit/Vision) rodava em
+// TODO frame entregue pela câmera (podendo passar de 30x/segundo), gastando
+// CPU à toa e competindo pela thread com o resto do app. Essa era uma das
+// causas do "app travado" e da camada de caixinhas (LIDO) sumindo/atrasando.
+// 5fps já é mais que suficiente pra leitura de rótulo parado na mão.
+const OCR_TARGET_FPS = 10;
 
 /**
  * Caixinhas desenhadas em cima do texto detectado ao vivo — a parte visual
@@ -4305,6 +4311,15 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
   const lockedRef = useRef(false);
   const lastMatchAtRef = useRef(0);
   const lastBoxUpdateAtRef = useRef(0);
+  // CORREÇÃO (v7) — trava contra chamadas sobrepostas: suggestProductByText
+  // (IA + busca web + varredura no catálogo) pode levar vários segundos, bem
+  // mais que o LIVE_MATCH_THROTTLE_MS (600ms). Sem essa trava, cada frame
+  // novo que chegava depois desses 600ms disparava OUTRA chamada pesada em
+  // cima da anterior que ainda nem tinha terminado — iam se empilhando várias
+  // chamadas de IA/web ao mesmo tempo, engasgando a thread do app inteira
+  // (essa era a causa principal do "app travado" e da camada de caixinhas
+  // atrasando/sumindo). Mesmo padrão já usado no modo Legacy (smartLoopBusyRef).
+  const isMatchingRef = useRef(false);
   // FATOR EXTRA DE VELOCIDADE — mesmo cache usado no ScannerScreenLegacy (ver
   // comentário grande em handleFrameOcrResult, logo abaixo): evita reprocessar
   // o catálogo inteiro quando o frame lido é idêntico ao anterior.
@@ -4397,7 +4412,15 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
     setLiveRecognizedText(trimmed);
 
     if (now - lastMatchAtRef.current < LIVE_MATCH_THROTTLE_MS) return;
+    // CORREÇÃO (v7): se já existe uma chamada pesada (IA/web/catálogo) em
+    // andamento, NÃO inicia outra em cima — só o throttle de tempo (acima)
+    // não bastava, porque suggestProductByText pode demorar bem mais que
+    // LIVE_MATCH_THROTTLE_MS. Continua tentando nos próximos frames; assim
+    // que a chamada em andamento terminar (ver `finally` abaixo), a próxima
+    // tentativa já passa livre.
+    if (isMatchingRef.current) return;
     lastMatchAtRef.current = now;
+    isMatchingRef.current = true;
 
     setLiveStatus((prev) => ({ analyzing: true, score: prev?.score ?? null }));
     // FATOR EXTRA DE VELOCIDADE / MENOS TRAVAMENTO — cada frame lido dispara
@@ -4438,6 +4461,9 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
       })
       .catch(() => {
         setLiveStatus({ analyzing: false, score: null });
+      })
+      .finally(() => {
+        isMatchingRef.current = false;
       });
   }, [suggestProductByText]);
 
@@ -4451,59 +4477,84 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
 
   const frameProcessor = useVCFrameProcessor((frame) => {
     'worklet';
-    // IMPORTANTE: o Frame da câmera só é válido durante este processamento —
-    // assim que scanOCR(frame) termina, o plugin pode fechar/invalidar o
-    // frame por baixo dos panos. Por isso frame.width/frame.height têm que
-    // ser lidos JÁ, antes de mais nada, e guardados em variável comum. Ler
-    // eles DEPOIS de chamar scanOCR foi o que causou o erro
-    // "Trying to access an already closed Frame".
-    const frameWidth = frame.width;
-    const frameHeight = frame.height;
 
-    // IMPORTANTE: nada de `?.` (optional chaining) nem `??` (nullish
-    // coalescing) aqui dentro. Essas sintaxes fazem o Babel criar variáveis
-    // temporárias por baixo dos panos, e quando o worklets-core recompila
-    // essa função sozinha (pra rodar isolada na thread da câmera), essa
-    // variável temporária pode ficar "órfã" — foi o que causou o crash
-    // "Property '_payload$blocks' doesn't exist" na primeira tentativa.
-    // Por isso tudo abaixo é escrito com verificação manual (if/ternário),
-    // mesmo sendo mais verboso.
-    if (!runOcrResultOnJS) return;
-    const raw = scanOCR(frame);
-    if (!raw) return;
+    // CORREÇÃO (v7) — trava de FPS: antes o scanOCR (bem pesado — ML Kit /
+    // Apple Vision) rodava em TODO frame entregue pela câmera, sem limite
+    // nenhum (o sensor entrega 30 frames por segundo ou mais). Isso deixava
+    // a thread da câmera constantemente ocupada, competindo por CPU com o
+    // resto do app — a causa raiz tanto do "app travado" quanto da camada
+    // de caixinhas (LIDO) sumindo ou demorando pra aparecer, porque as
+    // atualizações de estado do React (runOcrResultOnJS) ficavam represadas
+    // atrás desse trabalho pesado. runAtTargetFps limita a execução do
+    // bloco interno a OCR_TARGET_FPS vezes por segundo — os frames "de
+    // sobra" são pulados sem custo, a câmera continua fluida por baixo.
+    const runOcrStep = () => {
+      'worklet';
+      // IMPORTANTE: o Frame da câmera só é válido durante este processamento —
+      // assim que scanOCR(frame) termina, o plugin pode fechar/invalidar o
+      // frame por baixo dos panos. Por isso frame.width/frame.height têm que
+      // ser lidos JÁ, antes de mais nada, e guardados em variável comum. Ler
+      // eles DEPOIS de chamar scanOCR foi o que causou o erro
+      // "Trying to access an already closed Frame".
+      const frameWidth = frame.width;
+      const frameHeight = frame.height;
 
-    // Formatos diferentes de plugin de OCR embrulham o resultado de jeitos
-    // diferentes ({text, blocks} direto, ou {result: {text, blocks}}).
-    const payload = raw.result ? raw.result : raw;
-    const text = payload && payload.text ? payload.text : null;
-    if (!text) return;
+      // IMPORTANTE: nada de `?.` (optional chaining) nem `??` (nullish
+      // coalescing) aqui dentro. Essas sintaxes fazem o Babel criar variáveis
+      // temporárias por baixo dos panos, e quando o worklets-core recompila
+      // essa função sozinha (pra rodar isolada na thread da câmera), essa
+      // variável temporária pode ficar "órfã" — foi o que causou o crash
+      // "Property '_payload$blocks' doesn't exist" na primeira tentativa.
+      // Por isso tudo abaixo é escrito com verificação manual (if/ternário),
+      // mesmo sendo mais verboso.
+      if (!runOcrResultOnJS) return;
+      const raw = scanOCR(frame);
+      if (!raw) return;
 
-    // Achata blocks → lines → box num array simples de retângulos, só com o
-    // que o overlay precisa (left/top/width/height). A caixa delimitadora do
-    // MLKit às vezes vem como {left,top,right,bottom} (Android Rect) e às
-    // vezes como {left,top,width,height} — calcula o que faltar a partir do
-    // que tiver, em vez de assumir um formato só.
-    const boxes = [];
-    const blocks = payload && payload.blocks ? payload.blocks : [];
-    for (let bi = 0; bi < blocks.length; bi++) {
-      const block = blocks[bi];
-      const lines = block.lines ? block.lines : (block.elements ? block.elements : []);
-      for (let li = 0; li < lines.length; li++) {
-        const line = lines[li];
-        const box = line.box ? line.box : (line.boundingBox ? line.boundingBox : line.frame);
-        if (box) {
-          const left = box.left !== undefined ? box.left : (box.x !== undefined ? box.x : 0);
-          const top = box.top !== undefined ? box.top : (box.y !== undefined ? box.y : 0);
-          let width = box.width !== undefined ? box.width : 0;
-          let height = box.height !== undefined ? box.height : 0;
-          if (!width && box.right !== undefined) width = box.right - left;
-          if (!height && box.bottom !== undefined) height = box.bottom - top;
-          boxes.push({ left: left, top: top, width: width, height: height });
+      // Formatos diferentes de plugin de OCR embrulham o resultado de jeitos
+      // diferentes ({text, blocks} direto, ou {result: {text, blocks}}).
+      const payload = raw.result ? raw.result : raw;
+      const text = payload && payload.text ? payload.text : null;
+      if (!text) return;
+
+      // Achata blocks → lines → box num array simples de retângulos, só com o
+      // que o overlay precisa (left/top/width/height). A caixa delimitadora do
+      // MLKit às vezes vem como {left,top,right,bottom} (Android Rect) e às
+      // vezes como {left,top,width,height} — calcula o que faltar a partir do
+      // que tiver, em vez de assumir um formato só.
+      const boxes = [];
+      const blocks = payload && payload.blocks ? payload.blocks : [];
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const block = blocks[bi];
+        const lines = block.lines ? block.lines : (block.elements ? block.elements : []);
+        for (let li = 0; li < lines.length; li++) {
+          const line = lines[li];
+          const box = line.box ? line.box : (line.boundingBox ? line.boundingBox : line.frame);
+          if (box) {
+            const left = box.left !== undefined ? box.left : (box.x !== undefined ? box.x : 0);
+            const top = box.top !== undefined ? box.top : (box.y !== undefined ? box.y : 0);
+            let width = box.width !== undefined ? box.width : 0;
+            let height = box.height !== undefined ? box.height : 0;
+            if (!width && box.right !== undefined) width = box.right - left;
+            if (!height && box.bottom !== undefined) height = box.bottom - top;
+            boxes.push({ left: left, top: top, width: width, height: height });
+          }
         }
       }
-    }
 
-    runOcrResultOnJS(text, boxes, frameWidth, frameHeight);
+      runOcrResultOnJS(text, boxes, frameWidth, frameHeight);
+    };
+
+    // VisionCamera.runAtTargetFps já vem pronto na própria lib pra esse
+    // exato cenário (throttle dentro de um frame processor). Se por algum
+    // motivo essa versão da lib não tiver o helper (fallback defensivo,
+    // mesmo padrão usado em todo o resto do arquivo), roda sem throttle em
+    // vez de quebrar o frame processor inteiro.
+    if (VisionCamera && VisionCamera.runAtTargetFps) {
+      VisionCamera.runAtTargetFps(OCR_TARGET_FPS, runOcrStep)();
+    } else {
+      runOcrStep();
+    }
   }, [runOcrResultOnJS]);
 
   const handlePreviewLayout = useCallback((event) => {
