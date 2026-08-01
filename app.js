@@ -4114,16 +4114,19 @@ function ScannerScreen(props) {
 // repetidos com o mesmo texto não disparam busca nova — então baixar esse
 // valor não sobrecarrega a rede, só reage mais rápido quando o texto muda.
 const LIVE_MATCH_THROTTLE_MS = 600;
-// LIVE_BOX_THROTTLE_MS: intervalo mínimo entre atualizações visuais das
-// caixinhas "LIDO". Reduzido de 150 → 100ms (~10fps) para animação mais
-// suave sem gaguejo perceptível — re-render de retângulos SVG é leve.
-const LIVE_BOX_THROTTLE_MS = 100;
 // OCR_TARGET_FPS — CORREÇÃO (v7): antes o scanOCR (ML Kit/Vision) rodava em
 // TODO frame entregue pela câmera (podendo passar de 30x/segundo), gastando
 // CPU à toa e competindo pela thread com o resto do app. Essa era uma das
 // causas do "app travado" e da camada de caixinhas (LIDO) sumindo/atrasando.
-// 5fps já é mais que suficiente pra leitura de rótulo parado na mão.
 const OCR_TARGET_FPS = 20;
+// LIVE_BOX_THROTTLE_MS: intervalo mínimo entre atualizações visuais das
+// caixinhas "LIDO". CORREÇÃO (v9): antes era um valor fixo (100ms = 10fps)
+// desconectado do OCR_TARGET_FPS (20fps = 50ms) — ou seja, metade das
+// leituras novas do OCR ficavam "perdidas" no caminho porque a tela só
+// aceitava atualizar de 100 em 100ms. Agora esse intervalo acompanha
+// diretamente o intervalo real do OCR (1000 / OCR_TARGET_FPS), então toda
+// leitura nova aparece na tela assim que sai, sem atraso artificial extra.
+const LIVE_BOX_THROTTLE_MS = 1000 / OCR_TARGET_FPS;
 
 /**
  * Caixinhas desenhadas em cima do texto detectado ao vivo — a parte visual
