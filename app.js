@@ -144,6 +144,7 @@ Ignorei imagens/assets do projeto original (ícone, splash), como pedido.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   AppState,
   Easing,
@@ -161,7 +162,6 @@ import {
   View,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import * as ImagePicker from 'expo-image-picker';
 import { useSafeAreaInsets, SafeAreaProvider } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { BlurView } from 'expo-blur';
@@ -198,6 +198,30 @@ try {
 } catch (e) {
   extractTextFromImage = null;
   isTextExtractorSupported = false;
+}
+
+// CORREÇÃO — mesmo problema do expo-text-extractor acima: o
+// "Cannot find native module 'ExponentImagePicker'" que derrubava o app
+// inteiro (crash na abertura, antes de renderizar qualquer tela) acontecia
+// porque `import * as ImagePicker from 'expo-image-picker'` é um import
+// ESTÁTICO — ele roda antes de qualquer try/catch do nosso código. Se o
+// APK instalado no aparelho foi compilado sem esse módulo nativo (ex:
+// build antigo, de antes do expo-image-picker ser adicionado, ou o
+// pacote não ficou linkado no build nativo), essa linha já lança o erro
+// sozinha, e como ninguém pega essa exceção, ela sobe até virar um abort
+// nativo (crash de verdade, não só uma tela de erro do React). Trocado por
+// `require()` dentro de um try/catch: se o módulo não existir, a gente
+// simplesmente desativa a função de "escolher/tirar foto avulsa" em vez de
+// derrubar o app inteiro.
+let ImagePicker = null;
+let isImagePickerSupported = false;
+try {
+  // eslint-disable-next-line global-require
+  ImagePicker = require('expo-image-picker');
+  isImagePickerSupported = !!(ImagePicker && ImagePicker.launchCameraAsync && ImagePicker.launchImageLibraryAsync);
+} catch (e) {
+  ImagePicker = null;
+  isImagePickerSupported = false;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -5098,6 +5122,15 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   }, [scanMode, permission?.granted, locked, captureLiveFrame]);
 
   const handleSmartCameraCapture = useCallback(async () => {
+    if (!isImagePickerSupported) {
+      // Módulo nativo não disponível neste build — evita crash e avisa em vez
+      // de falhar silenciosamente sem explicação nenhuma.
+      Alert.alert(
+        'Recurso indisponível',
+        'A câmera avulsa (fora do modo tempo real) não está disponível nesta versão do app instalada. Reinstale o app com a build mais recente.',
+      );
+      return;
+    }
     try {
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
       if (status !== ImagePicker.PermissionStatus.GRANTED) {
@@ -5115,6 +5148,13 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   }, [processSmartImage]);
 
   const handleSmartGalleryPick = useCallback(async () => {
+    if (!isImagePickerSupported) {
+      Alert.alert(
+        'Recurso indisponível',
+        'A escolha de foto da galeria não está disponível nesta versão do app instalada. Reinstale o app com a build mais recente.',
+      );
+      return;
+    }
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (status !== ImagePicker.PermissionStatus.GRANTED) {
