@@ -887,6 +887,18 @@ function computeUnitPricePerLiter(preco, ml) {
 }
 
 /**
+ * Calcula o preço do FARDO/CAIXA: valor extraído (preço unitário lido na
+ * etiqueta ou salvo no sistema) × quantidade de unidades no fardo. Devolve
+ * null quando falta preço ou quantidade — assim quem chama sabe que não dá
+ * pra mostrar essa linha em vez de exibir "R$ NaN".
+ */
+function computeFardoPrice(precoUnitario, quantidade) {
+  if (precoUnitario === null || precoUnitario === undefined) return null;
+  if (quantidade === null || quantidade === undefined || quantidade <= 0) return null;
+  return precoUnitario * quantidade;
+}
+
+/**
  * Acha a quantidade de fardo/caixa num texto livre (OCR ou nome cadastrado):
  * "12X", "X12", "12 X", "CAIXA COM 12", "CX 12", "C/12". Devolve null se não
  * achar nenhum padrão — nesse caso productTextSimilarity simplesmente ignora
@@ -4087,6 +4099,21 @@ function UnitPriceLine({ preco, ml, style }) {
   return <Text style={style}>{formatBRL(perLiter)}/L</Text>;
 }
 
+/**
+ * Mostra "Fardo (12un): R$ 70,44" — preço unitário × quantidade de unidades
+ * na caixa/fardo, calculado automaticamente (sem precisar digitar nada).
+ * Some sozinho se faltar preço ou quantidade.
+ */
+function FardoPriceLine({ preco, quantidade, style }) {
+  const totalFardo = computeFardoPrice(preco, quantidade);
+  if (totalFardo === null) return null;
+  return (
+    <Text style={style}>
+      Fardo ({quantidade}un): {formatBRL(totalFardo)}
+    </Text>
+  );
+}
+
 function ScannerScreen(props) {
   if (isVisionCameraSupported) {
     return <LiveTextScanner {...props} />;
@@ -4792,6 +4819,11 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
                     ml={suggestion.ml}
                     style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 2 }}
                   />
+                  <FardoPriceLine
+                    preco={suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined ? suggestion.precoDetectado : suggestion.preco}
+                    quantidade={suggestion.quantidade}
+                    style={{ color: colors.foreground, fontSize: 14, fontFamily: 'Inter_700Bold', marginTop: 6 }}
+                  />
                 </View>
                 <AIReasoningPanel
                   product={suggestion.productObj}
@@ -5367,6 +5399,11 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
                     ml={suggestion.ml}
                     style={{ color: colors.mutedForeground, fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 2 }}
                   />
+                  <FardoPriceLine
+                    preco={suggestion.precoDetectado !== null && suggestion.precoDetectado !== undefined ? suggestion.precoDetectado : suggestion.preco}
+                    quantidade={suggestion.quantidade}
+                    style={{ color: colors.foreground, fontSize: 14, fontFamily: 'Inter_700Bold', marginTop: 6 }}
+                  />
                 </View>
                 <AIReasoningPanel
                   product={suggestion.productObj}
@@ -5747,6 +5784,16 @@ function ConfirmScreen({ params, onBack, onDone, lookupProduct, createProduct, u
                 fontSize: 12,
                 fontFamily: 'Inter_600SemiBold',
                 marginTop: 2,
+              }}
+            />
+            <FardoPriceLine
+              preco={centsToAmount(digits)}
+              quantidade={quantidadeInput.trim() === '' ? null : Number(quantidadeInput.replace(',', '.'))}
+              style={{
+                color: isEditing ? colors.accentForeground : '#ffffff',
+                fontSize: 13,
+                fontFamily: 'Inter_700Bold',
+                marginTop: 4,
               }}
             />
           </LinearGradient>
