@@ -682,7 +682,9 @@ function rowToProduct(row) {
 // fetch é cancelado à força e vira um erro de verdade, que os try/catch já
 // existentes sabem tratar (cai pro snapshot local, ou deixa a próxima
 // camada de reconhecimento assumir).
-const BASEROW_TIMEOUT_MS = 8000;
+// Reduzido 8000 → 5000ms: falha mais rápido e cai pro snapshot local,
+// evitando tela travada por longos períodos de rede lenta.
+const BASEROW_TIMEOUT_MS = 5000;
 
 async function baserowFetch(path, init) {
   const controller = new AbortController();
@@ -837,7 +839,8 @@ async function deleteProductRowRemote(id) {
 // isso deixava a tela travada em "carregando" indefinidamente pra qualquer
 // código de barras novo (que precisa consultar o Cosmos, não achado ainda
 // no Baserow). Mesma correção: AbortController com prazo.
-const COSMOS_TIMEOUT_MS = 8000;
+// Reduzido 8000 → 5000ms: falha mais rápido, produto segue pelo nome se Cosmos demorar.
+const COSMOS_TIMEOUT_MS = 5000;
 
 /** Consulta um produto pelo GTIN/código de barras no catálogo Cosmos. */
 async function lookupCosmosProduct(gtin) {
@@ -1406,7 +1409,8 @@ function buildStandardizedName({ category, searchableUpper }) {
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
-const GROQ_TIMEOUT_MS = 8000;
+// Reduzido 8000 → 5000ms: IA que demora mais que isso raramente melhora o resultado.
+const GROQ_TIMEOUT_MS = 5000;
 
 const GROQ_SYSTEM_PROMPT = [
   'Você organiza nomes de produto de supermercado pra ficarem curtos e fáceis',
@@ -2076,6 +2080,266 @@ function wordLookalikeTargetsCached() {
   return _wordLookalikeTargetsCache;
 }
 
+/* ======================================================================== */
+/* NOVOS FATORES DE CORREÇÃO AUTOMÁTICA (v8)                                 */
+/* ======================================================================== */
+
+/* ---- FATOR 1: EXPANSOR DE ABREVIAÇÕES OCR -------------------------------- */
+//
+// Lacuna real: a OCR lê a palavra visível na embalagem, que muitas vezes
+// aparece TRUNCADA (só cabe parte do nome na área legível da foto, ou a
+// fonte condensada junta letras demais pra caber numa área pequena).
+// Nenhum dos corretores anteriores trata isso — o corretor fuzzy
+// (fixWordLookalikes) tolera 1-2 erros numa palavra, mas "CERV" x
+// "CERVEJA" tem 4 erros, está muito longe. A expansão resolve na origem,
+// antes de qualquer comparação, convertendo o token curto para a forma
+// completa que está no catálogo.
+const OCR_ABBREVIATION_MAP = {
+  // Categoria / tipo de produto
+  'REFRI':       'REFRIGERANTE',
+  'REFRIG':      'REFRIGERANTE',
+  'CERV':        'CERVEJA',
+  'ACHOC':       'ACHOCOLATADO',
+  'ACHOCOL':     'ACHOCOLATADO',
+  'COND':        'CONDENSADO',
+  'INTEG':       'INTEGRAL',
+  'DENAT':       'DESNATADO',
+  'SEMIDESNAT':  'SEMIDESNATADO',
+  'CONC':        'CONCENTRADO',
+  'MARG':        'MARGARINA',
+  'BISC':        'BISCOITO',
+  'BOLACH':      'BOLACHA',
+  'CHOC':        'CHOCOLATE',
+  'IOGUR':       'IOGURTE',
+  'YOGURTE':     'IOGURTE',
+  'YOGUR':       'IOGURTE',
+  'QUEIJ':       'QUEIJO',
+  'DETER':       'DETERGENTE',
+  'DETERG':      'DETERGENTE',
+  'AMAC':        'AMACIANTE',
+  'SHAMPO':      'SHAMPOO',
+  'CREM':        'CREME',
+  'MACAR':       'MACARRAO',
+  'MACARRO':     'MACARRAO',
+  'FARIN':       'FARINHA',
+  'AZEIT':       'AZEITE',
+  'ENERGET':     'ENERGETICO',
+  'ISOT':        'ISOTONICO',
+  // Embalagem
+  'GAR':         'GARRAFA',
+  'GARR':        'GARRAFA',
+  'FRD':         'FARDO',
+  'PCT':         'PACOTE',
+  // Marcas com abreviação frequente em foto parcial
+  'ITAL':        'ITALAC',
+  'ITAMB':       'ITAMBE',
+  'PIRACANJ':    'PIRACANJUBA',
+  'NESTL':       'NESTLE',
+  'HEINEK':      'HEINEKEN',
+  'HEIMEK':      'HEINEKEN',   // OCR confunde N+E com M
+  'BUDW':        'BUDWEISER',
+  'ANTART':      'ANTARCTICA',
+  'ANTARCT':     'ANTARCTICA',
+  'ITAIP':       'ITAIPAVA',
+  'BONAF':       'BONAFONT',
+  'LINDOY':      'LINDOYA',
+  // Variantes truncadas
+  'INTGRL':      'INTEGRAL',
+  'DSNATADO':    'DESNATADO',
+  'SEMILAC':     'SEM LACTOSE',
+  'ZEROACUCAR':  'ZERO ACUCAR',
+};
+
+function expandOcrAbbreviations(normalizedUpperText) {
+  const words = normalizedUpperText.split(' ');
+  return words.map((word) => {
+    // Só expande tokens de tamanho "abreviável" — muito curto ou muito longo
+    // não é abreviação, é ruído ou palavra completa.
+    if (word.length < 3 || word.length > 13) return word;
+    return OCR_ABBREVIATION_MAP[word] ?? word;
+  }).join(' ');
+}
+
+/* ---- FATOR 2: CORRETOR DE MARCAS CONCATENADAS --------------------------- */
+//
+// Lacuna real: o separador (espaço ou hífen) entre partes de um nome
+// composto ("COCA-COLA", "LONG NECK", "SEM LACTOSE") é removido pela
+// OCR quando a câmera lê letras grudadas ou o espaço entre elas é menor
+// que o patamar de detecção do ML Kit. Resultado: "COCACOLA", "LONGNECK",
+// "SEMLACTOSE" — tokens únicos que têm comprimento muito diferente de
+// qualquer das partes isoladas, então o corretor fuzzy (que compara token
+// por token) não os pega.
+const BRAND_CONCATENATION_MAP = {
+  // Refrigerantes
+  'COCACOLA':            'COCA COLA',
+  'COCACOLAZERO':        'COCA COLA ZERO',
+  'GUARANAANTARCTICA':   'GUARANA ANTARCTICA',
+  'GUARANAANT':          'GUARANA ANTARCTICA',
+  'COCACOLALITE':        'COCA COLA LIGHT',
+  // Cervejas
+  'STELLAARTOIS':        'STELLA ARTOIS',
+  'NOVASCHIN':           'NOVA SCHIN',
+  'SERRAMALTE':          'SERRA MALTE',
+  'PUROMALTE':           'PURO MALTE',
+  'PURIMAMALTE':         'PURO MALTE',   // OCR erro
+  // Embalagem / formato
+  'LONGNEK':             'LONG NECK',
+  'LONGNECK':            'LONG NECK',
+  'LONGNEK':             'LONG NECK',
+  // Leite e derivados
+  'VERDECAMPO':          'VERDE CAMPO',
+  'BOANATA':             'BOA NATA',
+  'SAOLOURENCO':         'SAO LOURENCO',
+  'LEITECONDENSADO':     'LEITE CONDENSADO',
+  'LEITEDESNATADO':      'LEITE DESNATADO',
+  'LEITEINTEGRAL':       'LEITE INTEGRAL',
+  'LEITESEMIDESNATADO':  'LEITE SEMIDESNATADO',
+  'CREMELEITE':          'CREME DE LEITE',
+  'CREMEDESITE':         'CREME DE LEITE',   // OCR erro
+  // Variantes compostas
+  'SEMACUCAR':           'SEM ACUCAR',
+  'SEMLACTOSE':          'SEM LACTOSE',
+  'SEMGLUTEN':           'SEM GLUTEN',
+  'ZEROLACTOSE':         'ZERO LACTOSE',
+  'ZEROALCOOL':          'ZERO ALCOOL',
+  'SEMALGOOL':           'SEM ALCOOL',       // OCR erro
+  // Marcas compostas de água
+  'SAOGERALDO':          'SAO GERALDO',
+};
+
+function fixBrandConcatenation(normalizedUpperText) {
+  const words = normalizedUpperText.split(' ');
+  return words.map((word) => BRAND_CONCATENATION_MAP[word] ?? word).join(' ');
+}
+
+/* ---- FATOR 3: CORRETOR DE DIVISÃO DE PALAVRA ----------------------------- */
+//
+// Lacuna real: inverso do fator 2 — quando a OCR insere um espaço no meio
+// de uma palavra contínua, produzindo dois tokens adjacentes que juntos
+// formam a palavra certa. Exemplo: "HEI NEKEN" → "HEINEKEN", "ITAL AC" →
+// "ITALAC". O corretor fuzzy por token (fixWordLookalikes) não pega porque
+// ele testa CADA token isoladamente — "HEI" (3 letras) está longe de
+// "HEINEKEN" (8 letras) por Levenshtein.
+// Aplicado DEPOIS de fixWordLookalikes pra não interferir com o trabalho
+// que ele já fez em cada palavra individual.
+function fixOcrWordSplit(normalizedUpperText) {
+  const targets = wordLookalikeTargetsCached();
+  const words = normalizedUpperText.split(' ');
+  if (words.length < 2) return normalizedUpperText;
+
+  const result = [];
+  let i = 0;
+  while (i < words.length) {
+    if (i + 1 < words.length) {
+      const merged = words[i] + words[i + 1];
+      // Critério de segurança: só faz merge se:
+      //  • o resultado tem tamanho razoável (5-20 chars)
+      //  • as duas partes originais são curtas (sinal de split acidental,
+      //    não de duas palavras legítimas separadas)
+      //  • o token resultante existe EXATO na lista de alvos conhecidos
+      const mergeIsSafe =
+        merged.length >= 5 && merged.length <= 20 &&
+        words[i].length <= 9 && words[i + 1].length <= 9;
+      if (mergeIsSafe && targets.includes(merged)) {
+        result.push(merged);
+        i += 2;
+        continue;
+      }
+      // Também testa contra o mapa de concatenações (recupera "COCACOLA"
+      // que foi dividida em "COCA" + "COLA" — raro mas possível se outra
+      // etapa separou, e o resultado do merge está no mapa).
+      if (mergeIsSafe && BRAND_CONCATENATION_MAP[merged]) {
+        result.push(BRAND_CONCATENATION_MAP[merged]);
+        i += 2;
+        continue;
+      }
+    }
+    result.push(words[i]);
+    i += 1;
+  }
+  return result.join(' ');
+}
+
+/* ---- FATOR 4: COLAPSO DE TOKENS DUPLICADOS ------------------------------- */
+//
+// Lacuna real: quando a câmera cobre duas vezes a mesma área da etiqueta
+// (frames sobrepostos, ou varredura de cima pra baixo que re-lê a mesma
+// linha), o MLKit produz o mesmo bloco de texto duas vezes no payload —
+// resultado no texto final: "LEITE LEITE INTEGRAL", "COCA COLA COCA COLA
+// 350ML". Isso dilui os pesos por raridade (idf) e piora o casamento
+// porque os tokens repetidos "consomem" o budget de sobreposição sem
+// adicionar informação.
+function collapseDuplicateTokens(text) {
+  // Duplicata exata consecutiva (case-insensitive, mínimo 3 chars)
+  let result = text.replace(/\b([A-Za-z0-9]{3,})\s+\1\b/gi, '$1');
+  // Triplicata ou mais
+  result = result.replace(/\b([A-Za-z0-9]{3,})\s+\1\s+\1\b/gi, '$1');
+  // Par de tokens (2 palavras) repetido: "COCA COLA COCA COLA" → "COCA COLA"
+  result = result.replace(/\b([A-Za-z0-9]{3,}\s+[A-Za-z0-9]{3,})\s+\1\b/gi, '$1');
+  return result;
+}
+
+/* ---- FATOR 5: NORMALIZADOR DE VOLUME COM ESPAÇO EXTRA -------------------- */
+//
+// Lacuna real: OCR de baixa resolução ou fonte condensada separa dígitos
+// individuais com espaço, e às vezes até a unidade ("M L" em vez de "ML",
+// "K G" em vez de "KG"). O normalizador existente só colapsa espaço ENTRE
+// o número e a unidade quando ambos já estão inteiros — não lida com
+// dígitos separados individualmente. Sem correção, "5 0 0 M L" não extrai
+// ML nenhum, então o sinal "matador" do ML fica apagado.
+function normalizeOcrSpacedVolume(rawText) {
+  let t = rawText;
+  // Unidade partida: "M L" → "ML", "K G" → "KG", "U N" → "UN"
+  t = t.replace(/\bM\s+L\b/gi, 'ML');
+  t = t.replace(/\bK\s+G\b/gi, 'KG');
+  t = t.replace(/\bU\s+N\b/gi, 'UN');
+  // Dígito-a-dígito antes de unidade: "3 5 0 ML" → "350ML"
+  t = t.replace(/(\d)\s+(\d)\s+(\d)\s*(ML|KG|UN|L\b|G\b)/gi,
+    (_, a, b, c, u) => `${a}${b}${c}${u.toUpperCase()}`);
+  // Dois dígitos separados antes de unidade: "5 00 ML" → "500ML"
+  t = t.replace(/(\d)\s+(\d{2})\s*(ML|KG|UN|L\b|G\b)/gi,
+    (_, a, b, u) => `${a}${b}${u.toUpperCase()}`);
+  // Decimal com espaço: "1 . 5 L" ou "1,5 L" → "1.5L"
+  t = t.replace(/(\d)\s*[.,]\s*(\d)\s*(ML|L\b)/gi,
+    (_, a, b, u) => `${a}.${b}${u.toUpperCase()}`);
+  // Fração de litro conhecida: "1.5L" → "1500ML", "0.5L" → "500ML"
+  t = t.replace(/\b1\.5\s*L\b/gi, '1500ML');
+  t = t.replace(/\b0\.5\s*L\b/gi, '500ML');
+  t = t.replace(/\b1\.0\s*L\b/gi, '1000ML');
+  t = t.replace(/\b2\.0\s*L\b/gi, '2000ML');
+  return t;
+}
+
+/* ---- FATOR 6: BÔNUS POR MARCA CONFIRMADA NOS DOIS TEXTOS ---------------- */
+//
+// Lacuna real: o peso por raridade (idf) e o bônus de posição de marca
+// (BRAND_POSITION_BOOST) já ajudam quando uma marca aparece, mas só operam
+// DENTRO do score já montado — nenhum deles dá um salto de confiança quando
+// uma marca ESPECÍFICA DO DICIONÁRIO aparece TANTO no texto OCR quanto no
+// nome do catálogo. Esse é o sinal mais forte que existe pra confirmar um
+// produto ("a foto tem HEINEKEN, o candidato tem HEINEKEN — muito provavelmente
+// é o mesmo produto"), mas sem esse bônus ele fica "escondido" no peso do
+// token, diluído entre os outros termos.
+//
+// O bônus é aplicado UMA VEZ (a marca mais longa que bater, pra evitar que
+// "COCA" dê bônus em produto que deveria levar só por "COCA COLA"). O valor
+// (0.20) empurra o score final para mais perto de 1 quando a marca bate,
+// sem ultrapassar 1.
+function brandMatchBonus(normalizedOcr, normalizedCatalog) {
+  const allBrands = [
+    ...BRANDS.LEITE, ...BRANDS.CERVEJA, ...BRANDS.REFRIGERANTE, ...BRANDS.AGUA,
+  ].sort((a, b) => b.length - a.length); // testa marcas mais longas primeiro
+  for (const brand of allBrands) {
+    const b = toSearchableUpper(brand); // mesma normalização do resto do pipeline
+    if (normalizedOcr.includes(b) && normalizedCatalog.includes(b)) {
+      return 0.20; // bônus fixo: score + (1 - score) * 0.20
+    }
+  }
+  return 0;
+}
+
+/* ---- (fim dos novos fatores v8) ----------------------------------------- */
+
 /* ---- FILTRO DE REFLEXO DE LUZ: dígito aparecendo no meio de palavra ----- */
 //
 // Problema relatado: reflexo de luz na etiqueta (foto tirada com brilho
@@ -2160,7 +2424,7 @@ function reflectionDeglare(word) {
  * no nome do catálogo, só no texto lido pela câmera.
  */
 function preProcessOcrRaw(rawText) {
-  return (rawText ?? '')
+  const cleaned = (rawText ?? '')
     // Sequências de 3+ caracteres idênticos não-alfanuméricos → espaço
     // (ex.: "---", "===", "|||", "...") — artefatos de brilho/borda de etiqueta
     .replace(/([^A-Za-z0-9\s])\1{2,}/g, ' ')
@@ -2171,6 +2435,17 @@ function preProcessOcrRaw(rawText) {
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/\s{3,}/g, ' ')
     .trim();
+
+  // FATOR 5 (v8): corrige volume fragmentado ANTES de normalizar — "5 0 0 M L"
+  // → "500ML". Aplicado no texto bruto porque depois da normalização o espaço
+  // extra entre dígitos já se perdeu junto com outros ajustes.
+  const volFixed = normalizeOcrSpacedVolume(cleaned);
+
+  // FATOR 4 (v8): colapsa tokens duplicados consecutivos — "LEITE LEITE INTEGRAL"
+  // → "LEITE INTEGRAL". Aplicado no texto bruto (antes de normalizar) porque a
+  // duplicata costuma vir diretamente do payload do MLKit, não de artefato da
+  // normalização.
+  return collapseDuplicateTokens(volFixed);
 }
 
 function fixWordLookalikes(normalizedUpperText) {
@@ -2224,16 +2499,34 @@ function normalizeProductTextUncached(text) {
     .replace(/\s+/g, ' ')
     .trim();
 
+  // FATOR 1 (v8): expande abreviações antes de qualquer outro corretor.
+  // Ex.: "CERV INTEG" → "CERVEJA INTEGRAL". Aplicado no texto já em
+  // maiúsculas/sem acento pra bater exato com as chaves do mapa.
+  // Não é aplicado no nome do CATÁLOGO (Baserow) porque lá as palavras já
+  // chegam completas — quem se beneficia é só o texto vindo da câmera.
+  const expanded = expandOcrAbbreviations(base);
+
+  // FATOR 2 (v8): separa marcas concatenadas — "COCACOLA" → "COCA COLA".
+  // Aplicado antes do fixOcrNumberLookalikes pra que as partes separadas
+  // cheguem corretamente ao corretor de número.
+  const brandFixed = fixBrandConcatenation(expanded);
+
   // Corretor severo — só mexe em número disfarçado de letra perto de
   // unidade/fardo (ver comentário acima). Em texto já limpo (nome cadastrado
   // no Baserow) isso não faz diferença nenhuma; quem se beneficia é o texto
   // vindo da OCR da foto.
-  const numberFixed = fixOcrNumberLookalikes(base);
+  const numberFixed = fixOcrNumberLookalikes(brandFixed);
 
   // Corretor severo de PALAVRA (ZERO, DIET, LIGHT, GARRAFA...) — pega letra
   // trocada/a mais/a menos dentro da própria palavra (ZELO, ZLERO, ZTERO
   // viram ZERO). Ver comentário grande acima de fixWordLookalikes.
-  const fixed = fixWordLookalikes(numberFixed);
+  const wordFixed = fixWordLookalikes(numberFixed);
+
+  // FATOR 3 (v8): junta pares adjacentes que formam uma palavra conhecida —
+  // "HEI NEKEN" → "HEINEKEN", "ITAL AC" → "ITALAC". Aplicado DEPOIS do
+  // fixWordLookalikes pra não interferir com as correções por token
+  // que ele já fez individualmente.
+  const splitFixed = fixOcrWordSplit(wordFixed);
 
   // Uniformiza "200 ML" (com espaço) e "200ML" (grudado) pro MESMO formato
   // usado no catálogo (sempre grudado — ver appendPackSuffix). Sem isso, um
@@ -2241,7 +2534,7 @@ function normalizeProductTextUncached(text) {
   // texto de tela/site, e às vezes até na própria OCR por causa do espaço
   // entre letras) vira um TOKEN diferente de "200ML" e o casamento por
   // palavra falha, mesmo sendo exatamente o mesmo volume.
-  return fixed.replace(/\b(\d+(?:[.,]\d+)?)\s+(ML|L|KG|G|UN)\b/g, '$1$2');
+  return splitFixed.replace(/\b(\d+(?:[.,]\d+)?)\s+(ML|L|KG|G|UN)\b/g, '$1$2');
 }
 
 // FATOR EXTRA DE VELOCIDADE / MENOS TRAVAMENTO — cache transparente pra
@@ -2462,6 +2755,13 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   // "desempate"/reforço extra de detalhamento entre candidatos próximos.
   let score = stringScore * 0.19 + bigramScore * 0.05 + trigramScore * 0.06 + overlapScore * 0.7;
 
+  // FATOR 6 (v8): bônus por marca confirmada nos dois textos.
+  // Se uma marca do dicionário aparece tanto no texto OCR quanto no nome
+  // do catálogo, é o sinal mais forte possível de correspondência real —
+  // empurra o score em direção a 1 sem ultrapassar. Ver brandMatchBonus.
+  const bBonus = brandMatchBonus(cleanedA, upperB);
+  if (bBonus > 0) score = score + (1 - score) * bBonus;
+
   // ---- ML: sinal "matador" — bate MUITO forte quando é igual, e quase ----
   // ---- elimina quando é diferente -----------------------------------------
   // O volume impresso na embalagem (200ML, 350ML, 1L...) é um número exato,
@@ -2583,7 +2883,7 @@ async function findBestMatchByProductText(recognizedText) {
 
   let best = null;
   let bestScore = -1;
-  const EARLY_EXIT_SCORE = 0.97; // score tão alto que não vale a pena continuar
+  const EARLY_EXIT_SCORE = 0.93; // saída antecipada reduzida de 0.97→0.93: evita varrer catálogo inteiro quando já tem match forte
   for (const row of sortedRows) {
     if (!row.produto) continue;
     let score = productTextSimilarity(recognizedText, row.produto, tokenFrequency);
@@ -3292,7 +3592,10 @@ async function enrichRecognizedText(recognizedText) {
     () => findBestMatchByProductText(recognizedText),
     { found: false, score: null, product: null },
   );
-  if (direct.found && direct.score >= 0.65) {
+  // Limiar elevado de 0.65 → 0.72: match direto com ≥72% de confiança já é
+  // suficientemente forte — pula IA (Groq) e busca web (SerpApi) e retorna
+  // imediatamente, evitando até ~3s de latência de rede por scan.
+  if (direct.found && direct.score >= 0.72) {
     return { ...direct, stage: 'direto' };
   }
 
@@ -3323,7 +3626,9 @@ async function enrichRecognizedText(recognizedText) {
   //     (ex.: a IA às vezes devolve o texto idêntico ao original quando não
   //     via nada pra corrigir) — testar a mesma string 2x dá a mesma
   //     resposta 2x, só custa tempo à toa.
-  const MAX_WEB_TITLE_CANDIDATES = 3;
+  // Reduzido 3 → 2: cada título extra dispara uma varredura completa no
+  // catálogo; 2 candidatos já cobrem a maioria dos casos com menos CPU.
+  const MAX_WEB_TITLE_CANDIDATES = 2;
   const rawCandidates = [
     { text: recognizedText, stage: 'direto' },
     { text: aiGuess, stage: 'ia-ocr' },
@@ -4160,16 +4465,16 @@ function ScannerScreen(props) {
 /* ------------------------------------------------------------------------ */
 
 // LIVE_MATCH_THROTTLE_MS: intervalo mínimo entre chamadas ao pipeline de OCR
-// pesado (IA + Baserow). Reduzido de 850 → 600ms para escaneamento mais
-// responsivo. O cache de texto idêntico (lastAnalyzedRef) garante que ciclos
-// repetidos com o mesmo texto não disparam busca nova — então baixar esse
-// valor não sobrecarrega a rede, só reage mais rápido quando o texto muda.
-const LIVE_MATCH_THROTTLE_MS = 600;
-// OCR_TARGET_FPS — CORREÇÃO (v7): antes o scanOCR (ML Kit/Vision) rodava em
-// TODO frame entregue pela câmera (podendo passar de 30x/segundo), gastando
-// CPU à toa e competindo pela thread com o resto do app. Essa era uma das
-// causas do "app travado" e da camada de caixinhas (LIDO) sumindo/atrasando.
-const OCR_TARGET_FPS = 20;
+// pesado (IA + Baserow). Reduzido de 600 → 400ms: o cache de texto idêntico
+// (lastAnalyzedRef) garante que repetições não custam nada; 400ms reage mais
+// rápido quando o texto muda sem sobrecarregar a rede.
+const LIVE_MATCH_THROTTLE_MS = 400;
+// OCR_TARGET_FPS — Elevado de 20 → 24fps: intervalo de 41ms em vez de 50ms.
+// Isso torna o overlay de caixinhas (LIDO) notavelmente mais suave sem
+// sobrecarregar a thread da câmera — cada frame processado a mais é barato
+// (só lê texto, não dispara busca), e o cache de texto idêntico garante que
+// ciclos repetidos não chegam nem ao pipeline de casamento.
+const OCR_TARGET_FPS = 24;
 // LIVE_BOX_THROTTLE_MS: intervalo mínimo entre atualizações visuais das
 // caixinhas "LIDO". CORREÇÃO (v9): antes era um valor fixo (100ms = 10fps)
 // desconectado do OCR_TARGET_FPS (20fps = 50ms) — ou seja, metade das
@@ -4253,97 +4558,115 @@ const LiveTextCorners = React.memo(function LiveTextCorners({ left, top, width, 
 // Quantas caixas no máximo desenhar por ciclo (perf + não poluir a tela) e
 // quantas delas (as maiores — geralmente o nome/preço, não letra miúda)
 // ganham a etiqueta "LIDO" flutuante.
-const MAX_LIVE_BOXES = 10;
-const MAX_LIVE_TAGS = 3;
+// Reduzido de 10 → 8 caixas e 3 → 2 tags: menos trabalho de layout por
+// frame, overlay mais limpo sem perder as informações importantes.
+const MAX_LIVE_BOXES = 8;
+const MAX_LIVE_TAGS = 2;
 // Caixa cujo lado mais curto for menor que isso (em px do FRAME, não da
 // tela) é tratada como ruído — reflexo, poeira, risquinho — e descartada
 // antes até de entrar no cálculo de escala.
 const MIN_BOX_DIMENSION_PX = 12;
 
-function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
-  if (!boxes || boxes.length === 0 || !frameWidth || !frameHeight || !previewSize.width) return null;
+// React.memo: evita re-render quando o pai muda por outros motivos (ex.:
+// liveStatus, liveRecognizedText) mas boxes/previewSize não mudaram.
+const LiveTextBoxes = React.memo(function LiveTextBoxes({ boxes, frameWidth, frameHeight, previewSize }) {
+  // useMemo: recalcula a lista de caixas escaladas APENAS quando as entradas
+  // mudam de fato — cálculo de escala + projeção é feito uma vez por ciclo de
+  // OCR, não a cada re-render causado por outro estado do componente pai.
+  const scaledBoxes = React.useMemo(() => {
+    if (!boxes || boxes.length === 0 || !frameWidth || !frameHeight || !previewSize.width) return [];
 
-  // ── Por que NÃO rotacionamos as coordenadas aqui ──────────────────────────
-  //
-  // O plugin `vision-camera-ocr-plugin` cria o InputImage do MLKit assim:
-  //
-  //   InputImage.fromMediaImage(mediaImage, frame.getOrientation())
-  //
-  // Quando o celular está em retrato e o sensor é paisagem (o caso normal),
-  // `getOrientation()` devolve 90°. O MLKit recebe esse ângulo e já retorna
-  // as bounding boxes NO ESPAÇO ROTACIONADO (retrato):
-  //   box.left  → 0 … frameHeight  (= largura do retrato)
-  //   box.top   → 0 … frameWidth   (= altura do retrato)
-  //
-  // Portanto as coordenadas das caixas JÁ estão no sistema de coordenadas
-  // da tela — NÃO precisamos girá-las aqui. Se girássemos, estaríamos
-  // aplicando uma segunda rotação por cima da primeira (double-rotation),
-  // que é exatamente o bug que fazia as caixinhas aparecer deslocadas.
-  //
-  // O que SIM precisa ser feito é trocar qual dimensão do frame usar como
-  // "largura" e "altura" no cálculo de escala — porque o frame bruto ainda
-  // é paisagem (frameWidth > frameHeight), mas as coords das caixas usam a
-  // dimensão curta como largura e a longa como altura (o espaço retrato).
-  // ─────────────────────────────────────────────────────────────────────────
+    // ── Por que NÃO rotacionamos as coordenadas aqui ──────────────────────────
+    //
+    // O plugin `vision-camera-ocr-plugin` cria o InputImage do MLKit assim:
+    //
+    //   InputImage.fromMediaImage(mediaImage, frame.getOrientation())
+    //
+    // Quando o celular está em retrato e o sensor é paisagem (o caso normal),
+    // `getOrientation()` devolve 90°. O MLKit recebe esse ângulo e já retorna
+    // as bounding boxes NO ESPAÇO ROTACIONADO (retrato):
+    //   box.left  → 0 … frameHeight  (= largura do retrato)
+    //   box.top   → 0 … frameWidth   (= altura do retrato)
+    //
+    // Portanto as coordenadas das caixas JÁ estão no sistema de coordenadas
+    // da tela — NÃO precisamos girá-las aqui. Se girássemos, estaríamos
+    // aplicando uma segunda rotação por cima da primeira (double-rotation),
+    // que é exatamente o bug que fazia as caixinhas aparecer deslocadas.
+    //
+    // O que SIM precisa ser feito é trocar qual dimensão do frame usar como
+    // "largura" e "altura" no cálculo de escala — porque o frame bruto ainda
+    // é paisagem (frameWidth > frameHeight), mas as coords das caixas usam a
+    // dimensão curta como largura e a longa como altura (o espaço retrato).
+    // ─────────────────────────────────────────────────────────────────────────
 
-  const frameIsLandscape = frameWidth > frameHeight;
-  const previewIsPortrait = previewSize.height > previewSize.width;
-  // needsDimSwap = true: frame é paisagem mas display é retrato (ou vice-versa)
-  // → as coords das caixas usam frameHeight como largura e frameWidth como altura
-  const needsDimSwap = frameIsLandscape === previewIsPortrait;
+    const frameIsLandscape = frameWidth > frameHeight;
+    const previewIsPortrait = previewSize.height > previewSize.width;
+    // needsDimSwap = true: frame é paisagem mas display é retrato (ou vice-versa)
+    // → as coords das caixas usam frameHeight como largura e frameWidth como altura
+    const needsDimSwap = frameIsLandscape === previewIsPortrait;
 
-  // Dimensões do espaço de coordenadas que o MLKit usou ao gerar as caixas.
-  // Com needsDimSwap=true: effectiveW = curto do sensor = largura do retrato,
-  //                        effectiveH = longo do sensor  = altura do retrato.
-  const effectiveFrameWidth  = needsDimSwap ? frameHeight : frameWidth;
-  const effectiveFrameHeight = needsDimSwap ? frameWidth  : frameHeight;
+    // Dimensões do espaço de coordenadas que o MLKit usou ao gerar as caixas.
+    // Com needsDimSwap=true: effectiveW = curto do sensor = largura do retrato,
+    //                        effectiveH = longo do sensor  = altura do retrato.
+    const effectiveFrameWidth  = needsDimSwap ? frameHeight : frameWidth;
+    const effectiveFrameHeight = needsDimSwap ? frameWidth  : frameHeight;
 
-  // Escala "cover": UM fator só (o maior), depois desconta o corte lateral.
-  // Usar dois fatores separados (um pra X, outro pra Y) distorce a posição
-  // das caixas em aparelhos cujo sensor não tem exatamente a mesma proporção
-  // da tela (Xiaomi, Samsung com câmera de sensor 4:3 em tela 20:9, etc.).
-  const scale            = Math.max(previewSize.width / effectiveFrameWidth, previewSize.height / effectiveFrameHeight);
-  const scaledFrameWidth = effectiveFrameWidth  * scale;
-  const scaledFrameHeight= effectiveFrameHeight * scale;
-  const cropOffsetX      = (scaledFrameWidth  - previewSize.width)  / 2;
-  const cropOffsetY      = (scaledFrameHeight - previewSize.height) / 2;
+    // Escala "cover": UM fator só (o maior), depois desconta o corte lateral.
+    // Usar dois fatores separados (um pra X, outro pra Y) distorce a posição
+    // das caixas em aparelhos cujo sensor não tem exatamente a mesma proporção
+    // da tela (Xiaomi, Samsung com câmera de sensor 4:3 em tela 20:9, etc.).
+    const scale            = Math.max(previewSize.width / effectiveFrameWidth, previewSize.height / effectiveFrameHeight);
+    const scaledFrameWidth = effectiveFrameWidth  * scale;
+    const scaledFrameHeight= effectiveFrameHeight * scale;
+    const cropOffsetX      = (scaledFrameWidth  - previewSize.width)  / 2;
+    const cropOffsetY      = (scaledFrameHeight - previewSize.height) / 2;
 
-  // Descarta ruído (caixas minúsculas), ordena da maior pra menor (texto
-  // importante costuma ser grande) e limita em MAX_LIVE_BOXES pra não
-  // poluir a tela.
-  const cleanBoxes = boxes
-    .filter((box) => Math.min(box.width, box.height) >= MIN_BOX_DIMENSION_PX)
-    .sort((a, b) => b.width * b.height - a.width * a.height)
-    .slice(0, MAX_LIVE_BOXES);
+    // Descarta ruído (caixas minúsculas), ordena da maior pra menor (texto
+    // importante costuma ser grande) e limita em MAX_LIVE_BOXES pra não
+    // poluir a tela.
+    const result = [];
+    const sorted = boxes
+      .filter((box) => Math.min(box.width, box.height) >= MIN_BOX_DIMENSION_PX)
+      .sort((a, b) => b.width * b.height - a.width * a.height);
+
+    for (let i = 0; i < sorted.length && result.length < MAX_LIVE_BOXES; i++) {
+      const box = sorted[i];
+      // Converte pixel do espaço MLKit → pixel da tela:
+      //   pixel_tela = pixel_mlkit * scale − cropOffset
+      // (cropOffset desconta a parte da imagem que ficou fora da tela pelo "cover")
+      const left   = box.left   * scale - cropOffsetX;
+      const top    = box.top    * scale - cropOffsetY;
+      const width  = box.width  * scale;
+      const height = box.height * scale;
+
+      // Descarta caixas completamente fora da área visível.
+      if (left + width < 0 || top + height < 0 ||
+          left > previewSize.width || top > previewSize.height) {
+        continue;
+      }
+
+      // Chave estável baseada na posição arredondada: evita que pequenas
+      // variações de sub-pixel troquem a key e destruam/remonte o nó.
+      const stableKey = `${Math.round(left)}_${Math.round(top)}_${Math.round(width)}_${Math.round(height)}`;
+      result.push({ left, top, width, height, stableKey, showTag: result.length < MAX_LIVE_TAGS });
+    }
+    return result;
+  }, [boxes, frameWidth, frameHeight, previewSize]);
+
+  if (scaledBoxes.length === 0) return null;
 
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
-      {cleanBoxes.map((box, index) => {
-        // Converte pixel do espaço MLKit → pixel da tela:
-        //   pixel_tela = pixel_mlkit * scale − cropOffset
-        // (cropOffset desconta a parte da imagem que ficou fora da tela pelo "cover")
-        const left   = box.left   * scale - cropOffsetX;
-        const top    = box.top    * scale - cropOffsetY;
-        const width  = box.width  * scale;
-        const height = box.height * scale;
-
-        // Descarta caixas completamente fora da área visível.
-        if (left + width < 0 || top + height < 0 ||
-            left > previewSize.width || top > previewSize.height) {
-          return null;
-        }
-
-        return (
-          <LiveTextCorners
-            key={index}
-            left={left} top={top} width={width} height={height}
-            showTag={index < MAX_LIVE_TAGS}
-          />
-        );
-      })}
+      {scaledBoxes.map((item) => (
+        <LiveTextCorners
+          key={item.stableKey}
+          left={item.left} top={item.top} width={item.width} height={item.height}
+          showTag={item.showTag}
+        />
+      ))}
     </View>
   );
-}
+});
 
 function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, suggestProductByText }) {
   const insets = useSafeAreaInsets();
@@ -4448,7 +4771,25 @@ function LiveTextScanner({ sentCount, onOpenSent, onGoToConfirm, lookupProduct, 
 
     if (now - lastBoxUpdateAtRef.current >= LIVE_BOX_THROTTLE_MS) {
       lastBoxUpdateAtRef.current = now;
-      setLiveBoxes({ boxes: boxes ?? [], frameWidth, frameHeight });
+      // Atualização diferencial: só dispara setState quando as dimensões do
+      // frame ou a quantidade de caixas mudar — evita re-renders a cada ciclo
+      // OCR quando a câmera está parada e o MLKit devolve o mesmo número de
+      // caixas com os mesmos tamanhos de frame (caso mais comum no uso real).
+      const newBoxes = boxes ?? [];
+      setLiveBoxes((prev) => {
+        if (
+          prev.frameWidth === frameWidth &&
+          prev.frameHeight === frameHeight &&
+          prev.boxes.length === newBoxes.length
+        ) {
+          // Compara a área total das primeiras caixas como fingerprint barato:
+          // se a soma não mudou, provavelmente é o mesmo frame visual.
+          const prevArea = prev.boxes.slice(0, 3).reduce((s, b) => s + b.width * b.height, 0);
+          const nextArea = newBoxes.slice(0, 3).reduce((s, b) => s + b.width * b.height, 0);
+          if (Math.abs(prevArea - nextArea) < 400) return prev; // sem mudança — não re-renderiza
+        }
+        return { boxes: newBoxes, frameWidth, frameHeight };
+      });
     }
 
     if (lockedRef.current) return;
@@ -5028,11 +5369,12 @@ function ScannerScreenLegacy({ sentCount, onOpenSent, onGoToConfirm, lookupProdu
   // testa contra o catálogo, e atualiza a barra de confiança na hora. Pra
   // quem está usando, PARECE tempo real (não precisa tocar em nada, a
   // resposta é rápida), mesmo não sendo frame-a-frame de verdade.
-  // Reduzido de 1500 → 1150ms a pedido: escaneamento mais rápido. Ainda
-  // fica acima de ~1s pra não voltar a sobrecarregar de foto (mais fotos =
-  // mais decodificação de JPEG = mais uso de CPU = risco de travamento),
-  // mas perceptivelmente mais ágil que antes.
-  const SMART_LIVE_INTERVAL_MS = 750;
+  // Reduzido de 750 → 550ms: o modo legado (expo-text-extractor) tira uma
+  // foto a cada ciclo; 550ms mantém a fluidez sem sobrecarregar o decodificador
+  // JPEG. O guard smartLoopBusyRef garante que ciclos anteriores lentos não
+  // se empilhem — qualquer foto que demore mais de 550ms simplesmente faz o
+  // próximo ciclo ser pulado, sem acumular trabalho em fila.
+  const SMART_LIVE_INTERVAL_MS = 550;
 
   const captureLiveFrame = useCallback(async () => {
     if (smartLoopBusyRef.current || lockedRef.current) return;
