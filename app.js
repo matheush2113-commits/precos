@@ -2340,6 +2340,171 @@ function brandMatchBonus(normalizedOcr, normalizedCatalog) {
 
 /* ---- (fim dos novos fatores v8) ----------------------------------------- */
 
+/* ======================================================================== */
+/* NOVOS FATORES DE CORREÇÃO AUTOMÁTICA (v9)                                 */
+/* ======================================================================== */
+
+/* ---- FATOR 7: MAPA DE CORRUPÇÃO SEVERA ----------------------------------- */
+//
+// Lacuna real: existem dois tipos de erro que os corretores anteriores NÃO
+// cobrem:
+//
+//  a) Corrupção multi-letra por câmera ruim ou fonte de embalagem muito
+//     condensada — "CGLA" no lugar de "COCA COLA", "HEINKN" no lugar de
+//     "HEINEKEN". São tokens onde 3+ letras estão erradas SIMULTANEAMENTE,
+//     muito além do tolerado pelo fuzzy (que aceita ≤2 erros). O reflectionDeglare
+//     (dígito→letra) não ajuda porque o token tem só letras, todas erradas.
+//
+//  b) Variações de escrita de dígito-letra sem unidade de medida: "2ERO",
+//     "ZER0", "ZER9" — o reflectionDeglare JÁ pega (2→Z, 0→O, 9→O), mas
+//     só funciona quando o token é lido como palavra CONTÍNUA. Se a OCR
+//     inseriu espaço ("2 ERO"), "2" vira ruído (length < 3) e "ERO" é
+//     corrigido para "ZERO" pelo fuzzy — mas a segurança extra de listar
+//     explicitamente "2ERO"→"ZERO" custa zero e nunca faz mal.
+//
+// Estratégia: mapa EXATO de token → texto correto (pode ser multi-palavra).
+// Aplicado como PRIMEIRA etapa — antes de expansão de abreviação, antes de
+// qualquer fuzzy — pra que as etapas seguintes vejam a forma correta e
+// trabalhem a partir dela.
+const OCR_SEVERE_CORRUPTION_MAP = {
+  // ---- COCA-COLA: a marca mais lida em supermercado, e as letras "C" e "G"
+  //      são as mais confundidas entre si pela OCR (formas redondas parecidas).
+  //      "CGLA" é exatamente "COLA" com C→C e O→G — 1 erro, mas o "COCA"
+  //      sumiu; "CCOLA" tem C duplicado (reconhecimento parcial da sílaba inicial).
+  'CGLA':       'COCA COLA',
+  'CCOLA':      'COCA COLA',
+  'COCLA':      'COCA COLA',
+  'COKLA':      'COCA COLA',
+  'COCLA':      'COCA COLA',
+  'C0CA':       'COCA COLA',
+  'COCACLA':    'COCA COLA',
+  'COKCOLA':    'COCA COLA',
+  // ---- GUARANÁ ----
+  'GUARNA':     'GUARANA',
+  'GARANA':     'GUARANA',
+  'GUARANE':    'GUARANA',
+  'GUARANE':    'GUARANA',
+  'GURNA':      'GUARANA',
+  // ---- HEINEKEN: N↔H, K↔K, E↔F são confusões clássicas de OCR em rótulo
+  //      escuro com fonte sans-serif comprimida.
+  'HIENEKEN':   'HEINEKEN',
+  'HEINKN':     'HEINEKEN',
+  'HENKN':      'HEINEKEN',
+  'HNEKEN':     'HEINEKEN',
+  'HNKN':       'HEINEKEN',
+  'HEIMEKEN':   'HEINEKEN',
+  'HENEKEN':    'HEINEKEN',
+  // ---- BRAHMA ----
+  'BRHAM':      'BRAHMA',
+  'BRAHAM':     'BRAHMA',
+  'BRAMA':      'BRAHMA',
+  'BRAHM':      'BRAHMA',
+  // ---- ANTARCTICA ----
+  'ANTARCA':    'ANTARCTICA',
+  'ANTARCT':    'ANTARCTICA',
+  'ANTRCT':     'ANTARCTICA',
+  // ---- ITAIPAVA ----
+  'ITAIPV':     'ITAIPAVA',
+  'ITAIPVA':    'ITAIPAVA',
+  // ---- SKOL ----
+  'SKLO':       'SKOL',
+  'SK0L':       'SKOL',
+  // ---- SPRITE ----
+  'SPRIT':      'SPRITE',
+  'SPRTE':      'SPRITE',
+  // ---- FANTA ----
+  'FANT':       'FANTA',
+  'FNTA':       'FANTA',
+  // ---- PEPSI ----
+  'PEPS':       'PEPSI',
+  'PEP51':      'PEPSI',
+  // ---- Variações frequentes de ZERO (dígito no lugar de letra) ----
+  '2ERO':       'ZERO',
+  'ZER0':       'ZERO',
+  'ZER9':       'ZERO',
+  'Z3RO':       'ZERO',
+  'ZERP':       'ZERO',
+  // ---- DIET / LIGHT ----
+  'D1ET':       'DIET',
+  'DEIT':       'DIET',
+  'LGHT':       'LIGHT',
+  'L1GHT':      'LIGHT',
+  // ---- LEITE ----
+  'LEIT':       'LEITE',
+  'LE1TE':      'LEITE',
+  // ---- INTEGRAL ----
+  'INTEGRL':    'INTEGRAL',
+  'INTGRL':     'INTEGRAL',
+  // ---- GARRAFA ----
+  'GARRF':      'GARRAFA',
+  'GARAFA':     'GARRAFA',
+};
+
+/**
+ * Aplica o mapa de corrupção severa: substitui tokens exactamente iguais
+ * a uma chave do mapa pelo valor correspondente (que pode ser multi-palavra).
+ * Multi-palavra é expandida inline no texto.
+ */
+function fixSevereTokenCorruption(normalizedUpperText) {
+  const words = normalizedUpperText.split(' ');
+  const result = [];
+  for (const word of words) {
+    if (word.length < 3) { result.push(word); continue; }
+    const fix = OCR_SEVERE_CORRUPTION_MAP[word];
+    if (fix) {
+      // Multi-palavra: push each part individually
+      for (const part of fix.split(' ')) result.push(part);
+    } else {
+      result.push(word);
+    }
+  }
+  return result.join(' ');
+}
+
+/* ---- FATOR 8: CONVICÇÃO DE SCORE ---------------------------------------- */
+//
+// Lacuna real: o score é calculado como média ponderada linear (stringScore,
+// bigramScore, trigramScore, overlapScore, bônus de ML/peso/variante). Numa
+// escala LINEAR, a diferença entre 0.85 e 0.90 tem o mesmo "peso" que entre
+// 0.50 e 0.55 — mas para o resultado final do app isso é ABSURDAMENTE diferente:
+//   • 0.85 = "muito provavelmente certo"
+//   • 0.90 = "quase certeza"
+//   • 0.95 = "certeza"
+// Tratar essas três situações como equidistantes é matematicamente errado.
+//
+// Solução: função de convicção não-linear que amplifica o topo da escala.
+// Abaixo de 0.80: score passa sem alteração (região de incerteza — não mentir
+// sobre a confiança). A partir de 0.80: blend progressivo entre o score bruto
+// e uma curva de potência `1 - (1-s)^k` que "comprime" o gap até 1 de forma
+// cada vez mais agressiva conforme s se aproxima de 1.
+//
+// Transformações chave (k = 1.9):
+//   s=0.80 → 0.800  (continuidade — sem salto)
+//   s=0.85 → 0.882
+//   s=0.88 → 0.922
+//   s=0.90 → 0.944
+//   s=0.93 → 0.972
+//   s=0.95 → 0.985
+//   s=1.00 → 1.000
+//
+// Efeito prático IMPORTANTE: o patamar de saída antecipada (EARLY_EXIT_SCORE
+// = 0.93 no modo direto) antes exigia um score bruto ≥ 0.93 para disparar —
+// raramente alcançado sem ML confirmado. Com convicção, um score bruto de
+// ~0.90 (match forte de nome + ML batendo) já passa para 0.944 e dispara a
+// saída antecipada. Isso pode reduzir 30-40% das comparações em catalog
+// inteiro pra produtos conhecidos.
+function applyScoreConviction(rawScore) {
+  if (rawScore < 0.80) return rawScore;
+  // t: posição dentro da faixa [0.80, 1.0] → [0, 1], linear
+  const t = (rawScore - 0.80) / 0.20;
+  // amplified: curva de potência que comprime o "gap até 1" com expoente k=1.9
+  const amplified = 1 - Math.pow(1 - rawScore, 1.9);
+  // blend: t=0 → score bruto (continuidade em 0.80), t=1 → amplified (em 1.0)
+  return rawScore + t * (amplified - rawScore);
+}
+
+/* ---- (fim dos novos fatores v9) ----------------------------------------- */
+
 /* ---- FILTRO DE REFLEXO DE LUZ: dígito aparecendo no meio de palavra ----- */
 //
 // Problema relatado: reflexo de luz na etiqueta (foto tirada com brilho
@@ -2499,12 +2664,18 @@ function normalizeProductTextUncached(text) {
     .replace(/\s+/g, ' ')
     .trim();
 
+  // FATOR 7 (v9): corrupção severa — antes de qualquer outro corretor.
+  // "CGLA"→"COCA COLA", "HEINKN"→"HEINEKEN", "2ERO"→"ZERO" etc.
+  // Aplicado PRIMEIRO porque os corretores seguintes trabalham melhor
+  // partindo da forma já aproximada da correta.
+  const severityFixed = fixSevereTokenCorruption(base);
+
   // FATOR 1 (v8): expande abreviações antes de qualquer outro corretor.
   // Ex.: "CERV INTEG" → "CERVEJA INTEGRAL". Aplicado no texto já em
   // maiúsculas/sem acento pra bater exato com as chaves do mapa.
   // Não é aplicado no nome do CATÁLOGO (Baserow) porque lá as palavras já
   // chegam completas — quem se beneficia é só o texto vindo da câmera.
-  const expanded = expandOcrAbbreviations(base);
+  const expanded = expandOcrAbbreviations(severityFixed);
 
   // FATOR 2 (v8): separa marcas concatenadas — "COCACOLA" → "COCA COLA".
   // Aplicado antes do fixOcrNumberLookalikes pra que as partes separadas
@@ -2831,7 +3002,14 @@ function productTextSimilarity(rawA, rawB, tokenFrequency) {
   const variantMismatchCount = onlyInA.length + onlyInB.length;
   if (variantMismatchCount > 0) score *= 0.4 ** Math.min(variantMismatchCount, 2);
 
-  return Math.max(0, Math.min(1, score));
+  // FATOR 8 (v9): convicção não-linear — amplifica scores altos em direção
+  // a 1 de forma exponencial. Ver applyScoreConviction para a matemática
+  // completa. Aplicado ÚLTIMO, depois de todos os bônus/penalidades, para
+  // que a curva atue sobre o score final consolidado, não sobre etapas
+  // intermediárias.
+  const convicted = applyScoreConviction(score);
+
+  return Math.max(0, Math.min(1, convicted));
 }
 
 /**
